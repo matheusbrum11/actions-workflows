@@ -1,0 +1,28 @@
+# Example caller — copy into your project at `.github/workflows/cd-sandbox.yml`.
+#
+# Builds a signed sandbox artifact and ships it to Firebase App Distribution.
+# Triggers on pushes to develop (git flow) and on manual dispatch.
+# Pin @main to a tag (e.g. @v1) in production.
+name: CD Sandbox
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox:
+    uses: matheusbrum11/actions-workflows/.github/workflows/android-cd-sandbox.yml@main
+    with:
+      firebase-app-id: "1:1234567890:android:abcdef123456"  # your Firebase App ID
+      firebase-groups: "qa,internal"
+      # assemble-task: "assembleDemoRelease"   # override if you use flavors
+    secrets:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}

@@ -1,0 +1,160 @@
+# Reusable workflow: Release CD -> Google Play Store.
+#
+# Triggered by the caller on merge to main. Computes the next semantic version
+# from Conventional Commits (git flow): breaking -> major, feat -> minor,
+# fix -> patch. Builds a signed AAB, uploads it to Play, and tags the release.
+name: Android CD Release
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+      java-version:
+        type: string
+        default: "17"
+      java-distribution:
+        type: string
+        default: "temurin"
+      python-version:
+        type: string
+        default: "3.12"
+      bundle-task:
+        description: "Gradle task that builds the release AAB."
+        type: string
+        default: "bundleRelease"
+      aab-glob:
+        description: "Glob to locate the built AAB."
+        type: string
+        default: "**/build/outputs/bundle/**/*.aab"
+      package-name:
+        description: "Application id / Play package name (e.g. com.acme.app)."
+        type: string
+        required: true
+      track:
+        description: "Play track: internal | alpha | beta | production."
+        type: string
+        default: "internal"
+      tag-prefix:
+        description: "Prefix for release tags."
+        type: string
+        default: "v"
+      initial-version:
+        description: "Version used when no tag exists yet."
+        type: string
+        default: "0.0.0"
+      default-bump:
+        description: "Bump when no feat/fix/breaking commit is found (none|patch|minor|major)."
+        type: string
+        default: "patch"
+      version-code-strategy:
+        description: "run_number | commit_count."
+        type: string
+        default: "run_number"
+      version-code-offset:
+        type: number
+        default: 0
+      gate-ref:
+        description: "Ref of matheusbrum11/actions-workflows providing compute_version.py."
+        type: string
+        default: "main"
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: true
+      ANDROID_KEYSTORE_PASSWORD:
+        required: true
+      ANDROID_KEY_ALIAS:
+        required: true
+      ANDROID_KEY_PASSWORD:
+        required: true
+      PLAY_SERVICE_ACCOUNT_JSON:
+        description: "JSON for a Play Console service account with release access."
+        required: true
+
+permissions:
+  contents: write   # create tags and GitHub releases
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+        with:
+          repository: matheusbrum11/actions-workflows
+          ref: ${{ inputs.gate-ref }}
+          path: .cd-tooling
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Compute semantic version
+        id: version
+        run: |
+          python .cd-tooling/android/scripts/compute_version.py \
+            --tag-prefix "${{ inputs.tag-prefix }}" \
+            --initial-version "${{ inputs.initial-version }}" \
+            --default-bump "${{ inputs.default-bump }}" \
+            --version-code-strategy "${{ inputs.version-code-strategy }}" \
+            --run-number "${{ github.run_number }}" \
+            --version-code-offset "${{ inputs.version-code-offset }}"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode signing keystore
+        id: keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          echo "path=$RUNNER_TEMP/release.keystore" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed AAB
+        run: |
+          ./gradlew ${{ inputs.bundle-task }} \
+            -PversionCode="${{ steps.version.outputs.version_code }}" \
+            -PversionName="${{ steps.version.outputs.version_name }}" \
+            -Pandroid.injected.signing.store.file="${{ steps.keystore.outputs.path }}" \
+            -Pandroid.injected.signing.store.password="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.ANDROID_KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.ANDROID_KEY_PASSWORD }}"
+
+      - name: Locate AAB
+        id: artifact
+        run: |
+          AAB=$(find . -path "${{ inputs.aab-glob }}" -type f | head -n 1)
+          if [ -z "$AAB" ]; then echo "No AAB found for ${{ inputs.aab-glob }}"; exit 1; fi
+          echo "path=$AAB" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.package-name }}
+          releaseFiles: ${{ steps.artifact.outputs.path }}
+          track: ${{ inputs.track }}
+          status: completed
+
+      - name: Tag release and publish notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            Version **${{ steps.version.outputs.version_name }}**
+            (code ${{ steps.version.outputs.version_code }}, bump: ${{ steps.version.outputs.bump }})
+            — delivered to the **${{ inputs.track }}** track.

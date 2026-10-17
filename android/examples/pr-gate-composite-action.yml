@@ -1,0 +1,39 @@
+# Alternative example — using the composite ACTION directly instead of the
+# reusable workflow. Use this when you want to own the build/test/coverage steps
+# (custom flavors, caching, matrix, etc.) and only delegate the gate itself.
+#
+# Copy into your Android project at `.github/workflows/pr-gate.yml`.
+name: PR Gate (composite action)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: ./gradlew assembleDebug
+      - run: ./gradlew testDebugUnitTest
+      - run: ./gradlew jacocoTestReport
+
+      # The gate. Pin @main to a tag (e.g. @v1) in production.
+      - name: Quality gate
+        uses: matheusbrum11/actions-workflows/android@main
+        with:
+          project-root: "."
+          config-path: "android/quality-gate.yml"
+          base-ref: "origin/${{ github.base_ref }}"

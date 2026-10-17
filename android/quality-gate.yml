@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Android Quality Gate configuration
+#
+# Everything the gate does is driven from this file — nothing is hardcoded in
+# the Python. Copy it into your consumer project at `android/quality-gate.yml`
+# (or point the gate at it with --config) and tune to taste.
+# ---------------------------------------------------------------------------
+
+# Which directories are scanned for Kotlin sources (repo-relative).
+scan_paths:
+  - app/src/main
+
+# Glob patterns excluded from EVERY file-based rule (generated / vendored code).
+exempt_paths:
+  - "**/build/**"
+  - "**/generated/**"
+  - "**/*_Generated.kt"
+
+# How much to scan on a PR:
+#   changed -> only files changed vs. the base ref (fast; needs --base-ref)
+#   all     -> the whole project (used automatically when no base ref is given)
+scope: changed
+
+# The coding-standard context this gate enforces. This is informational (shown
+# in the summary) and a pointer for humans: to enforce a DIFFERENT standard,
+# repoint `document` at your own file and adjust the rules below / add new ones.
+# See the README section "Apontar o gate para um padrão próprio".
+coding_standard:
+  name: "Now in Android (single-module adaptation)"
+  document: android/README.md
+
+# Top-level coverage settings (the coverage rule reads min_percentage from here
+# unless overridden in its own block).
+coverage:
+  min_percentage: 90
+
+# ---------------------------------------------------------------------------
+# Rules. A rule only runs when `enabled: true`. `severity` (blocking|warning)
+# overrides the rule's default. Any other keys are rule-specific options.
+# ---------------------------------------------------------------------------
+rules:
+
+  no-comments:
+    enabled: true
+    severity: blocking
+    # Keep the leading license header (block comment before `package`).
+    allow_license_header: true
+    # Allow /** KDoc */ on PUBLIC declarations; KDoc on private/internal is flagged.
+    allow_kdoc_on_public_api: true
+    flag_line_comments: true
+    flag_block_comments: true
+
+  coverage:
+    enabled: true
+    severity: blocking
+    min_percentage: 90
+    metric: LINE            # LINE | INSTRUCTION | BRANCH
+    report_paths:
+      - "**/build/reports/jacoco/**/*.xml"
+
+  layering:
+    enabled: true
+    severity: blocking
+    # Map each layer to the package segment that identifies it.
+    layers:
+      data: ".data."
+      domain: ".domain."
+      ui: ".ui."
+    # Forbidden dependency directions (ui -> domain -> data is the allowed flow).
+    forbidden:
+      data: [domain, ui]
+      domain: [ui]
+
+  # --- Add your own rules below, e.g.: -------------------------------------
+  # your-rule-id:
+  #   enabled: true
+  #   severity: warning
+  #   forbidden_token: "FIXME"
+  # (See android/scripts/quality_gate/rules/_template.py)

@@ -1,0 +1,24 @@
+# Example caller — copy this into your Android project at
+# `.github/workflows/pr-gate.yml`.
+#
+# It triggers on pull requests and delegates the whole pipeline (build -> tests
+# -> coverage -> quality gate) to the reusable workflow in this repo. Pin `@main`
+# to a tag (e.g. @v1) in production.
+name: PR Gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    uses: matheusbrum11/actions-workflows/.github/workflows/android-pr-gate.yml@main
+    with:
+      java-version: "17"
+      # Override any default if your project differs, e.g.:
+      # assemble-task: "assembleDemoDebug"
+      # test-task: "testDemoDebugUnitTest"
+      # coverage-task: "createDebugCombinedCoverageReport"
+      # config-path: "android/quality-gate.yml"
