@@ -1,0 +1,55 @@
+name: "Android Quality Gate"
+description: >
+  Runs the extensible Python quality gate against an Android project and writes a
+  Markdown summary. Fails when any blocking finding is reported. The gate script
+  is bundled with this action, so consumers only need `uses:` — no extra checkout.
+
+inputs:
+  project-root:
+    description: "Path to the Android project to analyze (the checkout to scan)."
+    required: false
+    default: "."
+  config-path:
+    description: "Path to the gate config YAML (relative to project-root or absolute)."
+    required: false
+    default: "android/quality-gate.yml"
+  base-ref:
+    description: >
+      Git ref the PR is compared against (e.g. origin/main). Enables changed-files
+      scope. Leave empty to scan the whole project.
+    required: false
+    default: ""
+  python-version:
+    description: "Python version used to run the gate."
+    required: false
+    default: "3.12"
+  fail-on-warning:
+    description: "If 'true', warnings also fail the gate (default: only blocking)."
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install gate dependencies
+      shell: bash
+      run: pip install -r "${{ github.action_path }}/scripts/requirements.txt"
+
+    - name: Run quality gate
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/scripts
+      run: |
+        ARGS=(--project-root "${{ inputs.project-root }}" --config "${{ inputs.config-path }}")
+        if [ -n "${{ inputs.base-ref }}" ]; then
+          ARGS+=(--base-ref "${{ inputs.base-ref }}")
+        fi
+        if [ "${{ inputs.fail-on-warning }}" = "true" ]; then
+          ARGS+=(--fail-on-warning)
+        fi
+        python -m quality_gate "${ARGS[@]}"

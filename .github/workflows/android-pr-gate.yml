@@ -1,0 +1,107 @@
+# Reusable workflow: Android PR CI + quality gate.
+#
+# Build (debug) -> unit tests -> coverage (JaCoCo) -> quality gate.
+# Call it from a consumer repo with `uses:` (see android/examples/pr-gate.yml).
+# Every path, version and task is a parameter, so it stays generic.
+name: Android PR Gate
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner for the job."
+        type: string
+        default: "ubuntu-latest"
+      java-version:
+        description: "JDK version."
+        type: string
+        default: "17"
+      java-distribution:
+        description: "JDK distribution (setup-java)."
+        type: string
+        default: "temurin"
+      python-version:
+        description: "Python version for the gate."
+        type: string
+        default: "3.12"
+      assemble-task:
+        description: "Gradle task for the debug build."
+        type: string
+        default: "assembleDebug"
+      test-task:
+        description: "Gradle task for unit tests (must fail the build on failure)."
+        type: string
+        default: "testDebugUnitTest"
+      coverage-task:
+        description: "Gradle task that produces the JaCoCo XML report."
+        type: string
+        default: "jacocoTestReport"
+      config-path:
+        description: "Path to the gate config YAML in the consumer repo."
+        type: string
+        default: "android/quality-gate.yml"
+      gate-ref:
+        description: "Ref of matheusbrum11/actions-workflows providing the gate script."
+        type: string
+        default: "main"
+      fail-on-warning:
+        description: "If true, warnings also fail the gate."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  android-gate:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          # Full history so the gate can diff against the PR base ref.
+          fetch-depth: 0
+
+      - name: Checkout gate scripts
+        uses: actions/checkout@v4
+        with:
+          repository: matheusbrum11/actions-workflows
+          ref: ${{ inputs.gate-ref }}
+          path: .gate-tooling
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug
+        run: ./gradlew ${{ inputs.assemble-task }}
+
+      - name: Unit tests
+        run: ./gradlew ${{ inputs.test-task }}
+
+      - name: Coverage (JaCoCo)
+        run: ./gradlew ${{ inputs.coverage-task }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install gate dependencies
+        run: pip install -r .gate-tooling/android/scripts/requirements.txt
+
+      - name: Run quality gate
+        env:
+          PYTHONPATH: .gate-tooling/android/scripts
+        run: |
+          ARGS=(--project-root . --config "${{ inputs.config-path }}" \
+                --base-ref "origin/${{ github.base_ref }}")
+          if [ "${{ inputs.fail-on-warning }}" = "true" ]; then
+            ARGS+=(--fail-on-warning)
+          fi
+          python -m quality_gate "${ARGS[@]}"

@@ -1,0 +1,3 @@
+# Dependencies for the Android quality gate.
+# Kept intentionally minimal — only PyYAML, for reading the config file.
+PyYAML>=6.0

@@ -1,0 +1,106 @@
+# Reusable workflow: Sandbox CD -> Firebase App Distribution.
+#
+# Builds a signed artifact and uploads it to Firebase App Distribution for
+# internal testers. Meant for a develop/feature flow (not the store). Every
+# path, version and task is a parameter so it stays generic.
+name: Android CD Sandbox
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+      java-version:
+        type: string
+        default: "17"
+      java-distribution:
+        type: string
+        default: "temurin"
+      assemble-task:
+        description: "Gradle task that builds the APK to distribute."
+        type: string
+        default: "assembleRelease"
+      artifact-glob:
+        description: "Glob to locate the built APK."
+        type: string
+        default: "**/build/outputs/apk/**/*.apk"
+      firebase-app-id:
+        description: "Firebase App ID (e.g. 1:1234567890:android:abcdef)."
+        type: string
+        required: true
+      firebase-groups:
+        description: "Comma-separated Firebase tester groups."
+        type: string
+        default: "testers"
+      version-code-offset:
+        description: "Added to github.run_number to form the versionCode."
+        type: number
+        default: 0
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: true
+      ANDROID_KEYSTORE_PASSWORD:
+        required: true
+      ANDROID_KEY_ALIAS:
+        required: true
+      ANDROID_KEY_PASSWORD:
+        required: true
+      FIREBASE_SERVICE_ACCOUNT_JSON:
+        description: "JSON for a service account with Firebase App Distribution access."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode signing keystore
+        id: keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          echo "path=$RUNNER_TEMP/release.keystore" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed sandbox artifact
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: "sandbox-${{ github.ref_name }}-${{ github.run_number }}"
+        run: |
+          ./gradlew ${{ inputs.assemble-task }} \
+            -PversionCode="$((VERSION_CODE + ${{ inputs.version-code-offset }}))" \
+            -PversionName="$VERSION_NAME" \
+            -Pandroid.injected.signing.store.file="${{ steps.keystore.outputs.path }}" \
+            -Pandroid.injected.signing.store.password="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.ANDROID_KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.ANDROID_KEY_PASSWORD }}"
+
+      - name: Locate APK
+        id: artifact
+        run: |
+          APK=$(find . -path "${{ inputs.artifact-glob }}" -type f | head -n 1)
+          if [ -z "$APK" ]; then echo "No APK found for ${{ inputs.artifact-glob }}"; exit 1; fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "Found $APK"
+
+      - name: Upload to Firebase App Distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ inputs.firebase-app-id }}
+          serviceCredentialsFileContent: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          groups: ${{ inputs.firebase-groups }}
+          file: ${{ steps.artifact.outputs.path }}
+          releaseNotes: "Sandbox build ${{ github.ref_name }} @ ${{ github.sha }}"
