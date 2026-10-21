@@ -1,0 +1,175 @@
+# Reusable workflow: Ktor API CI + coverage gate.
+#
+# Build (tests + detekt/ktlint via `build`) -> Kover XML/HTML reports ->
+# coverage verification (>= coverage-min). It publishes a coverage summary to
+# the job summary, posts/updates a PR comment, and uploads the Kover HTML report
+# as an artifact. Docs-only PRs pass without running Gradle.
+# Call it from a consumer repo with `uses:` (see ktor-api/README.md).
+name: Ktor CI
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: "JDK version (temurin)."
+        type: string
+        default: "21"
+      coverage-min:
+        description: "Minimum coverage percentage enforced by koverVerify."
+        type: number
+        default: 90
+      working-directory:
+        description: "Directory the Gradle build runs from."
+        type: string
+        default: "."
+      gradle-tasks-extra:
+        description: "Extra Gradle tasks/flags appended to the build invocation."
+        type: string
+        default: ""
+
+# GITHUB_TOKEN only: read the code, write PR comments.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ktor-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          # Full history so docs-only detection can diff against the PR base ref.
+          fetch-depth: 0
+
+      - name: Detect docs-only changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+            files=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          elif [ -n "${EVENT_BEFORE:-}" ] && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            files=$(git diff --name-only "$EVENT_BEFORE" HEAD)
+          else
+            files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+          fi
+          echo "Changed files:"
+          echo "$files"
+          docs_only=true
+          if [ -z "$files" ]; then
+            # No diff detected (e.g. first push): run the full pipeline.
+            docs_only=false
+          fi
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md|docs/*|.claude/*) ;;
+              *) docs_only=false ;;
+            esac
+          done <<< "$files"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "Docs-only change: $docs_only"
+
+      - name: Report docs-only skip
+        if: ${{ steps.changes.outputs.docs_only == 'true' }}
+        run: |
+          {
+            echo "## Ktor CI"
+            echo
+            echo "Docs-only change detected (\`*.md\`, \`docs/**\`, \`.claude/**\`)."
+            echo "Gradle build and coverage gate were skipped; the check passes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK
+        if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build, test and generate coverage reports
+        if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew build koverXmlReport koverHtmlReport ${{ inputs.gradle-tasks-extra }}
+
+      - name: Coverage summary and PR comment
+        if: ${{ !cancelled() && steps.changes.outputs.docs_only != 'true' }}
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+          COVERAGE_PARSER: |
+            import sys
+            import xml.etree.ElementTree as ET
+
+            report_path, minimum = sys.argv[1], float(sys.argv[2])
+            root = ET.parse(report_path).getroot()
+
+
+            def coverage_for(counter_type):
+                # Kover emits JaCoCo-style <counter type= missed= covered=> at report level.
+                for counter in root.findall("counter"):
+                    if counter.get("type") == counter_type:
+                        missed = int(counter.get("missed", "0"))
+                        covered = int(counter.get("covered", "0"))
+                        total = missed + covered
+                        pct = (100.0 * covered / total) if total else 100.0
+                        return pct, covered, total
+                return None
+
+
+            print("## Ktor CI coverage")
+            print()
+            print("Minimum required: **{:.0f}%**".format(minimum))
+            print()
+            print("| Metric | Covered | Total | Coverage |")
+            print("|--------|---------|-------|----------|")
+            for label, key in (("Line", "LINE"), ("Branch", "BRANCH"), ("Instruction", "INSTRUCTION")):
+                data = coverage_for(key)
+                if data is None:
+                    continue
+                pct, covered, total = data
+                mark = "white_check_mark" if pct >= minimum else "x"
+                print("| {} | {} | {} | {:.2f}% :{}: |".format(label, covered, total, pct, mark))
+        run: |
+          set -euo pipefail
+          report=$(find . -type f -path '*reports/kover/*.xml' | head -n1 || true)
+          body="$RUNNER_TEMP/coverage.md"
+          if [ -z "$report" ]; then
+            {
+              echo "## Ktor CI coverage"
+              echo
+              echo "No Kover XML report was found. Ensure \`koverXmlReport\` runs in the build."
+            } > "$body"
+          else
+            python3 -c "$COVERAGE_PARSER" "$report" "$COVERAGE_MIN" > "$body"
+          fi
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "${PR_NUMBER:-}" ]; then
+            gh pr comment "$PR_NUMBER" --body-file "$body" --edit-last \
+              || gh pr comment "$PR_NUMBER" --body-file "$body"
+          fi
+
+      - name: Upload Kover HTML report
+        if: ${{ !cancelled() && steps.changes.outputs.docs_only != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kover-html-report
+          path: ${{ inputs.working-directory }}/**/build/reports/kover/html
+          if-no-files-found: ignore
+
+      - name: Verify coverage gate
+        if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew koverVerify -PkoverMinCoverage=${{ inputs.coverage-min }}
