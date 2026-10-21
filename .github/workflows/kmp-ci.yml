@@ -1,0 +1,170 @@
+# Reusable workflow: Kotlin Multiplatform PR CI + coverage gate.
+#
+# Runs on Linux and covers every target that a Linux runner can build: Android,
+# the JVM/desktop target and the shared commonTest sources. Coverage is measured
+# with Kover (which aggregates all measurable KMP targets) and enforced by
+# koverVerify at the configured minimum. The iOS targets need macOS and live in
+# the separate, optional kmp-ios.yml.
+#
+# Call it from a consumer repo with `uses:` (see kmp/README.md).
+name: KMP CI
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: "JDK version."
+        type: string
+        default: "21"
+      coverage-min:
+        description: "Minimum aggregated coverage percentage enforced by koverVerify."
+        type: number
+        default: 90
+      working-directory:
+        description: "Directory that holds the Gradle build."
+        type: string
+        default: "."
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  kmp-ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          # Full history so the docs-only diff can reach the PR base ref.
+          fetch-depth: 0
+
+      - name: Detect code changes
+        id: changes
+        working-directory: .
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            git fetch --no-tags origin "${{ github.base_ref }}" || true
+            changed="$(git diff --name-only "$base"...HEAD)"
+          else
+            changed="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null \
+                       || git diff --name-only HEAD~1 HEAD)"
+          fi
+          echo "Changed files:"
+          echo "$changed"
+          # Keep only files that are NOT docs: anything that remains means code ran.
+          code="$(printf '%s\n' "$changed" \
+                  | grep -vE '(^|/)[^/]+\.md$|^docs/|^\.claude/' || true)"
+          if [ -n "$changed" ] && [ -z "$code" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "Only docs changed - Gradle steps will be skipped."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK
+        if: steps.changes.outputs.docs_only != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        if: steps.changes.outputs.docs_only != 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Android build
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew assembleDebug
+
+      - name: Android lint
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew lintDebug
+
+      - name: Static analysis (detekt + ktlint)
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew detekt ktlintCheck
+
+      - name: Unit tests (commonTest / JVM / Android)
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew desktopTest testDebugUnitTest
+
+      - name: Konsist tests
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew konsistTest
+
+      - name: Desktop build
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew desktopJar
+
+      - name: Coverage report (Kover)
+        if: steps.changes.outputs.docs_only != 'true'
+        run: ./gradlew koverXmlReport koverHtmlReport
+
+      - name: Coverage gate (koverVerify)
+        if: steps.changes.outputs.docs_only != 'true'
+        # The consumer's koverVerify rule reads this property for its minimum.
+        run: ./gradlew koverVerify -Pkover.coverageThreshold=${{ inputs.coverage-min }}
+
+      - name: Coverage summary
+        if: steps.changes.outputs.docs_only != 'true'
+        env:
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+          REPORT: ${{ inputs.working-directory }}/build/reports/kover/report.xml
+        run: |
+          python3 - "$REPORT" "$COVERAGE_MIN" > "$RUNNER_TEMP/coverage.md" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+
+          report, minimum = sys.argv[1], float(sys.argv[2])
+          covered = missed = 0
+          try:
+              root = ET.parse(report).getroot()
+              for counter in root.findall("counter"):
+                  if counter.get("type") == "LINE":
+                      covered = int(counter.get("covered", 0))
+                      missed = int(counter.get("missed", 0))
+          except (OSError, ET.ParseError):
+              print("### KMP coverage\n\nNo Kover report found.")
+              sys.exit(0)
+
+          total = covered + missed
+          pct = (covered / total * 100) if total else 0.0
+          status = "passed" if pct >= minimum else "FAILED"
+          print("### KMP coverage (aggregated, Kover)\n")
+          print(f"| Metric | Value |")
+          print(f"| --- | --- |")
+          print(f"| Line coverage | {pct:.2f}% |")
+          print(f"| Minimum | {minimum:.0f}% |")
+          print(f"| Gate | {status} |")
+          PY
+          cat "$RUNNER_TEMP/coverage.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment coverage on PR
+        if: steps.changes.outputs.docs_only != 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --edit-last --body-file "$RUNNER_TEMP/coverage.md" \
+          || gh pr comment "${{ github.event.pull_request.number }}" \
+            --body-file "$RUNNER_TEMP/coverage.md"
+
+      - name: Docs-only summary
+        if: steps.changes.outputs.docs_only == 'true'
+        working-directory: .
+        run: |
+          echo "Docs-only change: Gradle build, tests and coverage gate skipped." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Kover HTML report
+        # Current v4 family, consistent with the other actions here; not pinned
+        # in android-pr-gate.yml, so the latest major is used.
+        if: steps.changes.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kover-html-report
+          path: ${{ inputs.working-directory }}/build/reports/kover/html/
+          if-no-files-found: ignore

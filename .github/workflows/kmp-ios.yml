@@ -1,0 +1,50 @@
+# Reusable workflow: Kotlin Multiplatform iOS build + test (macOS).
+#
+# SEPARATE and OPTIONAL. The iOS targets need a macOS runner, which costs about
+# 10x a Linux runner, so this is NOT meant to run on every PR. Call it from a
+# scheduled or manually dispatched consumer workflow (see kmp/README.md).
+#
+# Kover does not measure iosMain, so there is no coverage gate here - this job
+# verifies that the iOS targets compile and that their tests pass.
+name: KMP iOS
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: "JDK version."
+        type: string
+        default: "21"
+      working-directory:
+        description: "Directory that holds the Gradle build."
+        type: string
+        default: "."
+
+permissions:
+  contents: read
+
+jobs:
+  kmp-ios:
+    # macOS runner required for the iOS targets (~10x the cost of ubuntu-latest).
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: iOS build
+        run: ./gradlew compileKotlinIosSimulatorArm64
+
+      - name: iOS tests (simulator)
+        run: ./gradlew iosSimulatorArm64Test
