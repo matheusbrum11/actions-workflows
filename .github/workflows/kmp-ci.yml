@@ -91,7 +91,7 @@ jobs:
 
       - name: Unit tests (commonTest / JVM / Android)
         if: steps.changes.outputs.docs_only != 'true'
-        run: ./gradlew desktopTest testDebugUnitTest
+        run: ./gradlew jvmTest testDebugUnitTest
 
       - name: Konsist tests
         if: steps.changes.outputs.docs_only != 'true'
@@ -99,7 +99,7 @@ jobs:
 
       - name: Desktop build
         if: steps.changes.outputs.docs_only != 'true'
-        run: ./gradlew desktopJar
+        run: ./gradlew :desktopApp:assemble
 
       - name: Coverage report (Kover)
         if: steps.changes.outputs.docs_only != 'true'
