@@ -1,0 +1,361 @@
+# Reusable workflow: Ktor API CD -> Artifact Registry -> Cloud Run.
+#
+# Two modes:
+#   build-and-deploy  builds the image from the checked-out ref, tags it with the
+#                     git SHA, pushes it and deploys it (DEV).
+#   promote           does NOT rebuild: deploys the image already in the registry
+#                     for the tag's commit SHA (PROD). Fails if DEV never built it.
+#
+# Auth is Workload Identity Federation only (no service account keys). Infra
+# values default to the GitHub Environment variables named after `environment`;
+# inputs with the same meaning override them. See ktor-api/README.md.
+name: Ktor CD
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "build-and-deploy (build, push, deploy) or promote (deploy an existing image)."
+        type: string
+        required: true
+      environment:
+        description: "GitHub Environment name (dev or prod); scopes variables and approvals."
+        type: string
+        required: true
+      project-id:
+        description: "GCP project id. Default: vars.GCP_PROJECT_ID of the environment."
+        type: string
+        default: ""
+      region:
+        description: "Cloud Run / Artifact Registry region. Default: vars.GCP_REGION, then southamerica-east1."
+        type: string
+        default: ""
+      service:
+        description: "Cloud Run service name. Default: vars.CLOUD_RUN_SERVICE."
+        type: string
+        default: ""
+      image-repository:
+        description: "Image path without tag (REGION-docker.pkg.dev/PROJECT/REPO/IMAGE). Default: vars.IMAGE_REPOSITORY. In prod it points at DEV's registry."
+        type: string
+        default: ""
+      runtime-service-account:
+        description: "Service account the Cloud Run service runs as. Default: vars.GCP_RUNTIME_SERVICE_ACCOUNT."
+        type: string
+        default: ""
+      deploy-service-account:
+        description: "Service account impersonated through WIF to deploy. Default: vars.GCP_DEPLOY_SERVICE_ACCOUNT."
+        type: string
+        default: ""
+      workload-identity-provider:
+        description: "Full WIF provider resource name. Default: vars.GCP_WORKLOAD_IDENTITY_PROVIDER."
+        type: string
+        default: ""
+      secrets-mapping:
+        description: "Comma-separated ENV_VAR=SECRET_NAME:VERSION pairs for --set-secrets (names only, never values)."
+        type: string
+        default: "SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_ANON_KEY=SUPABASE_ANON_KEY:latest,SUPABASE_JWKS_URL=SUPABASE_JWKS_URL:latest"
+      env-vars:
+        description: "Optional non-secret env vars for --set-env-vars (KEY=VALUE,KEY2=VALUE2)."
+        type: string
+        default: ""
+      image-sha:
+        description: "Commit SHA used as the image tag. Default: github.sha (for a tag trigger, the tagged commit)."
+        type: string
+        default: ""
+      dockerfile:
+        description: "Dockerfile path, relative to the build context."
+        type: string
+        default: "Dockerfile"
+      context:
+        description: "Docker build context."
+        type: string
+        default: "."
+      platform:
+        description: "Build platform. Cloud Run only runs linux/amd64."
+        type: string
+        default: "linux/amd64"
+      use-build-cache:
+        description: "Use the GitHub Actions cache for Docker layers."
+        type: boolean
+        default: true
+      port:
+        description: "Container port (Cloud Run injects it as PORT)."
+        type: number
+        default: 8080
+      cpu:
+        description: "CPU limit per instance."
+        type: string
+        default: "1"
+      memory:
+        description: "Memory limit per instance."
+        type: string
+        default: "512Mi"
+      min-instances:
+        description: "Minimum instances (0 scales to zero)."
+        type: number
+        default: 0
+      max-instances:
+        description: "Maximum instances."
+        type: number
+        default: 3
+      concurrency:
+        description: "Max concurrent requests per instance."
+        type: number
+        default: 80
+      allow-unauthenticated:
+        description: "Allow public (unauthenticated) invocations; the API enforces its own auth."
+        type: boolean
+        default: true
+      smoke-path:
+        description: "Path requested by the smoke test; must return HTTP 200."
+        type: string
+        default: "/v1/health"
+      smoke-timeout-seconds:
+        description: "Total time the smoke test keeps retrying."
+        type: number
+        default: 120
+    outputs:
+      service-url:
+        description: "Cloud Run service URL."
+        value: ${{ jobs.deploy.outputs.service-url }}
+      revision:
+        description: "Name of the deployed Cloud Run revision."
+        value: ${{ jobs.deploy.outputs.revision }}
+      image:
+        description: "Deployed image reference, pinned by digest."
+        value: ${{ jobs.deploy.outputs.image }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    # Never cancel a running deploy: a half-applied rollout is worse than waiting.
+    concurrency:
+      group: ktor-cd-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    outputs:
+      service-url: ${{ steps.deploy.outputs.service-url }}
+      revision: ${{ steps.deploy.outputs.revision }}
+      image: ${{ steps.image.outputs.ref }}
+    env:
+      MODE: ${{ inputs.mode }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      PROJECT_ID: ${{ inputs.project-id || vars.GCP_PROJECT_ID }}
+      REGION: ${{ inputs.region || vars.GCP_REGION || 'southamerica-east1' }}
+      SERVICE: ${{ inputs.service || vars.CLOUD_RUN_SERVICE }}
+      IMAGE_REPOSITORY: ${{ inputs.image-repository || vars.IMAGE_REPOSITORY }}
+      RUNTIME_SA: ${{ inputs.runtime-service-account || vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+      DEPLOY_SA: ${{ inputs.deploy-service-account || vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      WIF_PROVIDER: ${{ inputs.workload-identity-provider || vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      IMAGE_SHA: ${{ inputs.image-sha || github.sha }}
+    steps:
+      - name: Validate inputs and configuration
+        run: |
+          case "$MODE" in
+            build-and-deploy | promote) ;;
+            *) echo "::error::mode must be 'build-and-deploy' or 'promote', got '$MODE'"; exit 1 ;;
+          esac
+          missing=0
+          for name in PROJECT_ID REGION SERVICE IMAGE_REPOSITORY RUNTIME_SA DEPLOY_SA WIF_PROVIDER; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty. Set the matching variable on the '$ENVIRONMENT' GitHub Environment or pass the input."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          if ! printf '%s' "$IMAGE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::image-sha must be a full 40-character lowercase commit SHA, got '$IMAGE_SHA'"
+            exit 1
+          fi
+
+      - name: Checkout
+        if: inputs.mode == 'build-and-deploy'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Set up Docker Buildx
+        if: inputs.mode == 'build-and-deploy'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Configure Docker for Artifact Registry
+        if: inputs.mode == 'build-and-deploy'
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        id: build
+        if: inputs.mode == 'build-and-deploy'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platform }}
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_SHA }}
+          cache-from: ${{ inputs.use-build-cache && 'type=gha' || '' }}
+          cache-to: ${{ inputs.use-build-cache && 'type=gha,mode=max' || '' }}
+          provenance: false
+
+      - name: Resolve image
+        id: image
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if [ "$MODE" = "build-and-deploy" ]; then
+            digest="$BUILT_DIGEST"
+          else
+            # Promote must never build: an image missing here means DEV never produced this commit.
+            if ! digest="$(gcloud artifacts docker images describe "${IMAGE_REPOSITORY}:${IMAGE_SHA}" \
+              --project="$PROJECT_ID" --format='value(image_summary.digest)' 2>/tmp/describe.err)" \
+              || [ -z "$digest" ]; then
+              cat /tmp/describe.err
+              echo "::error::Image ${IMAGE_REPOSITORY}:${IMAGE_SHA} not found (or not readable). Promote only deploys images already built by a build-and-deploy run for this exact commit; if DEV never built ${IMAGE_SHA}, run the DEV deploy first. If the image exists, check that the deploy service account has artifactregistry.reader on that repository."
+              exit 1
+            fi
+          fi
+          if [ -z "$digest" ]; then
+            echo "::error::Could not determine the image digest."
+            exit 1
+          fi
+          echo "ref=${IMAGE_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Capture current revision
+        id: previous
+        run: |
+          # Empty on the first deploy, when the service does not exist yet.
+          prev="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" \
+            --format='value(status.latestReadyRevisionName)' 2>/dev/null || true)"
+          echo "revision=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          PORT_INPUT: ${{ inputs.port }}
+          CPU: ${{ inputs.cpu }}
+          MEMORY: ${{ inputs.memory }}
+          MIN_INSTANCES: ${{ inputs.min-instances }}
+          MAX_INSTANCES: ${{ inputs.max-instances }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          SECRETS_MAPPING: ${{ inputs.secrets-mapping }}
+          ENV_VARS: ${{ inputs.env-vars }}
+          ALLOW_UNAUTH: ${{ inputs.allow-unauthenticated }}
+        run: |
+          args=(
+            "$SERVICE"
+            --project="$PROJECT_ID"
+            --region="$REGION"
+            --image="$IMAGE_REF"
+            --service-account="$RUNTIME_SA"
+            --port="$PORT_INPUT"
+            --cpu="$CPU"
+            --memory="$MEMORY"
+            --min-instances="$MIN_INSTANCES"
+            --max-instances="$MAX_INSTANCES"
+            --concurrency="$CONCURRENCY"
+            --update-labels="commit-sha=${IMAGE_SHA},deploy-env=${ENVIRONMENT}"
+            --quiet
+          )
+          [ -z "$SECRETS_MAPPING" ] || args+=(--set-secrets="$SECRETS_MAPPING")
+          [ -z "$ENV_VARS" ] || args+=(--set-env-vars="$ENV_VARS")
+          if [ "$ALLOW_UNAUTH" = "true" ]; then
+            args+=(--allow-unauthenticated)
+          else
+            args+=(--no-allow-unauthenticated)
+          fi
+
+          gcloud run deploy "${args[@]}"
+
+          url="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
+          revision="$(gcloud run services describe "$SERVICE" --project="$PROJECT_ID" --region="$REGION" --format='value(status.latestReadyRevisionName)')"
+          if [ -z "$url" ] || [ -z "$revision" ]; then
+            echo "::error::Deploy finished but the service URL or revision could not be read."
+            exit 1
+          fi
+          echo "service-url=${url}" >> "$GITHUB_OUTPUT"
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        id: smoke
+        env:
+          SERVICE_URL: ${{ steps.deploy.outputs.service-url }}
+          SMOKE_PATH: ${{ inputs.smoke-path }}
+          SMOKE_TIMEOUT: ${{ inputs.smoke-timeout-seconds }}
+        run: |
+          target="${SERVICE_URL}${SMOKE_PATH}"
+          deadline=$((SECONDS + SMOKE_TIMEOUT))
+          delay=3
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$target" || true)"
+            echo "attempt ${attempt}: GET ${SMOKE_PATH} -> HTTP ${code}"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Smoke test failed: ${SMOKE_PATH} did not return 200 within ${SMOKE_TIMEOUT}s (last status: ${code})."
+              exit 1
+            fi
+            sleep "$delay"
+            delay=$((delay < 15 ? delay + 3 : 15))
+          done
+
+      - name: Rollback instructions
+        if: failure() && steps.smoke.outcome == 'failure'
+        env:
+          PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
+          FAILED_REVISION: ${{ steps.deploy.outputs.revision }}
+        run: |
+          {
+            echo "### Smoke test failed in \`${ENVIRONMENT}\`"
+            echo
+            echo "Revision \`${FAILED_REVISION}\` is deployed and may be receiving traffic. **No automatic rollback was done.**"
+            echo
+            if [ -n "$PREVIOUS_REVISION" ]; then
+              echo "Previous revision: \`${PREVIOUS_REVISION}\`. To roll back:"
+              echo
+              echo '```bash'
+              echo "gcloud run services update-traffic ${SERVICE} --project=${PROJECT_ID} --region=${REGION} --to-revisions=${PREVIOUS_REVISION}=100"
+              echo '```'
+            else
+              echo "There was no previous revision (first deploy), so there is nothing to roll back to."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Job summary
+        if: success()
+        env:
+          SERVICE_URL: ${{ steps.deploy.outputs.service-url }}
+          REVISION: ${{ steps.deploy.outputs.revision }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          PREVIOUS_REVISION: ${{ steps.previous.outputs.revision }}
+        run: |
+          {
+            echo "### Deploy to \`${ENVIRONMENT}\` succeeded"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Mode | \`${MODE}\` |"
+            echo "| Service | \`${SERVICE}\` (\`${PROJECT_ID}\`, \`${REGION}\`) |"
+            echo "| URL | ${SERVICE_URL} |"
+            echo "| Revision | \`${REVISION}\` |"
+            echo "| Previous revision | \`${PREVIOUS_REVISION:-none}\` |"
+            echo "| Commit | \`${IMAGE_SHA}\` |"
+            echo "| Image | \`${IMAGE_REF}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
