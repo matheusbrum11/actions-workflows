@@ -46,6 +46,8 @@ configuration and coverage exclusions.
 Inputs: `java-version` (default `"21"`), `coverage-min` (default `90`),
 `working-directory` (default `"."`), `gradle-tasks-extra` (default `""`).
 
+Also: `.github/workflows/ktor-cd.yml` — reusable CD (`workflow_call`): builds the image, pushes it to Artifact Registry and deploys to Cloud Run through Workload Identity Federation, then smoke-tests `/v1/health`. Modes: `build-and-deploy` (DEV) and `promote` (PROD, deploys the image already built for the commit). Details in [`ktor-api/README.md`](ktor-api/README.md#ktor-api-cd--artifact-registry--cloud-run).
+
 ### KMP
 
 Folder: [`kmp/`](kmp/README.md) — see that README for the coverage exclusions
@@ -200,7 +202,7 @@ Keeping macOS off the per-PR path keeps routine CI on cheap Linux minutes.
 
 ## Next steps (CD)
 
-Continuous delivery for the Ktor and KMP families is **not** covered yet. This
+Continuous delivery for the KMP family is **not** covered yet (Ktor CD lives in `ktor-cd.yml`, see above). This
 section is a placeholder: deployment/release workflows for those families will
 be documented here once defined. (The Android CD workflows already exist — see
 [`android/CD.md`](android/CD.md).)
