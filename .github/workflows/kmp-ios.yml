@@ -1,8 +1,9 @@
 # Reusable workflow: Kotlin Multiplatform iOS build + test (macOS).
 #
 # SEPARATE and OPTIONAL. The iOS targets need a macOS runner, which costs about
-# 10x a Linux runner, so this is NOT meant to run on every PR. Call it from a
-# scheduled or manually dispatched consumer workflow (see kmp/README.md).
+# 10x a Linux runner, so this is NOT meant to run on every PR or on a schedule.
+# It only runs when the caller was started by workflow_dispatch (manual run
+# before each release); any other caller event skips the job. See kmp/README.md.
 #
 # Kover does not measure iosMain, so there is no coverage gate here - this job
 # verifies that the iOS targets compile and that their tests pass.
@@ -25,6 +26,12 @@ permissions:
 
 jobs:
   kmp-ios:
+    # github.event_name is the caller's event. Guards against a consumer wiring
+    # this job to pull_request, push or schedule by mistake.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    concurrency:
+      group: kmp-ios-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     # macOS runner required for the iOS targets (~10x the cost of ubuntu-latest).
     runs-on: macos-latest
     defaults:
@@ -41,6 +48,7 @@ jobs:
           java-version: ${{ inputs.java-version }}
 
       - name: Set up Gradle
+        # Cache is read-only outside the default branch (action default).
         uses: gradle/actions/setup-gradle@v4
 
       - name: iOS build

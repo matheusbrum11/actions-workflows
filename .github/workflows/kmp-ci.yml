@@ -6,6 +6,11 @@
 # koverVerify at the configured minimum. The iOS targets need macOS and live in
 # the separate, optional kmp-ios.yml.
 #
+# Jobs:
+#   secrets  gitleaks scan of the full git history (always runs).
+#   kmp-ci   full gate (mode=full) or only the Android assemble (mode=deploy),
+#            so push runs to main/release do not repeat tests/coverage.
+#
 # Call it from a consumer repo with `uses:` (see kmp/README.md).
 name: KMP CI
 
@@ -24,18 +29,75 @@ on:
         description: "Directory that holds the Gradle build."
         type: string
         default: "."
+      mode:
+        description: "full (PR gate: lint, tests, coverage) or deploy (push to main/release: assemble only)."
+        type: string
+        default: "full"
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: kmp-ci-secrets-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release checksums file.
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+
+      - name: Scan git history for secrets
+        run: |
+          set -euo pipefail
+          args=(git --redact --no-banner --exit-code 1)
+          # An optional consumer config extends the defaults (allowlists, custom rules).
+          if [ -f .gitleaks.toml ]; then
+            args+=(--config .gitleaks.toml)
+          fi
+          # --redact masks every secret value in the output; findings show rule and location only.
+          "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" .
+
   kmp-ci:
     runs-on: ubuntu-latest
+    concurrency:
+      group: kmp-ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
+      - name: Validate mode
+        working-directory: .
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "$MODE" in
+            full|deploy) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected full or deploy)"; exit 1 ;;
+          esac
+
       - name: Checkout project
         uses: actions/checkout@v4
         with:
@@ -75,6 +137,8 @@ jobs:
 
       - name: Set up Gradle
         if: steps.changes.outputs.docs_only != 'true'
+        # Cache is read-only outside the default branch (action default), so PRs
+        # reuse the cache written by pushes to main without polluting it.
         uses: gradle/actions/setup-gradle@v4
 
       - name: Android build
@@ -82,36 +146,36 @@ jobs:
         run: ./gradlew assembleDebug
 
       - name: Android lint
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         run: ./gradlew lintDebug
 
       - name: Static analysis (detekt + ktlint)
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         run: ./gradlew detekt ktlintCheck
 
       - name: Unit tests (commonTest / JVM / Android)
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         run: ./gradlew jvmTest testDebugUnitTest
 
       - name: Konsist tests
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         run: ./gradlew konsistTest
 
       - name: Desktop build
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         run: ./gradlew :desktopApp:assemble
 
       - name: Coverage report (Kover)
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         run: ./gradlew koverXmlReport koverHtmlReport
 
       - name: Coverage gate (koverVerify)
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         # The consumer's koverVerify rule reads this property for its minimum.
         run: ./gradlew koverVerify -Pkover.coverageThreshold=${{ inputs.coverage-min }}
 
       - name: Coverage summary
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         env:
           COVERAGE_MIN: ${{ inputs.coverage-min }}
           REPORT: ${{ inputs.working-directory }}/build/reports/kover/report.xml
@@ -144,7 +208,7 @@ jobs:
           cat "$RUNNER_TEMP/coverage.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment coverage on PR
-        if: steps.changes.outputs.docs_only != 'true' && github.event_name == 'pull_request'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -162,7 +226,7 @@ jobs:
       - name: Upload Kover HTML report
         # Current v4 family, consistent with the other actions here; not pinned
         # in android-pr-gate.yml, so the latest major is used.
-        if: steps.changes.outputs.docs_only != 'true'
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
         uses: actions/upload-artifact@v4
         with:
           name: kover-html-report

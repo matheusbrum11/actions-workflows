@@ -95,6 +95,24 @@ jobs:
 | `java-version` | JDK version for setup-java | `"21"` |
 | `coverage-min` | Minimum aggregated coverage percentage | `90` |
 | `working-directory` | Directory that holds the Gradle build | `"."` |
+| `mode` | `full` (PR gate) or `deploy` (push to `main`/`release/**`: only `assembleDebug`, no lint/tests/coverage) | `"full"` |
+
+Ao contrário do Ktor, o KMP não tem job de migrations. O job `secrets` (gitleaks
+`8.30.1`, histórico completo, saída `--redact`, `.gitleaks.toml` opcional na raiz)
+roda sempre; veja a seção "Jobs de segurança" em [`../ktor-api/README.md`](../ktor-api/README.md#jobs-de-segurança-e-migrations-v120)
+para allowlist. Triggers recomendados:
+
+```yaml
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+jobs:
+  ci:
+    uses: matheusbrum11/actions-workflows/.github/workflows/kmp-ci.yml@v1.2.0
+    with:
+      mode: ${{ github.event_name == 'pull_request' && 'full' || 'deploy' }}
+```
 
 The gate uses the built-in `GITHUB_TOKEN` (the caller grants
 `pull-requests: write`) to post the coverage comment. No other secrets are
@@ -108,14 +126,15 @@ required.
 ## Optional iOS workflow
 
 `kmp-ios.yml` builds and tests the iOS targets on **macOS**. macOS runners cost
-roughly **10x** a Linux runner, so do not run it on every PR — call it from a
-**scheduled** or **manually dispatched** workflow:
+roughly **10x** a Linux runner, so it runs **only by manual dispatch** — no
+schedule, not on PRs. Dispatch it before each release (GitHub: **Actions → iOS →
+Run workflow**, or `gh workflow run ios.yml --ref release/x.y.z`). The job
+carries an `if: github.event_name == 'workflow_dispatch'` guard, so if a consumer
+wires it to `schedule`, `push` or `pull_request` by mistake, it is skipped.
 
 ```yaml
-name: iOS nightly
+name: iOS
 on:
-  schedule:
-    - cron: "0 3 * * *"   # nightly
   workflow_dispatch:
 permissions:
   contents: read

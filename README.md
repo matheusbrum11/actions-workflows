@@ -43,8 +43,14 @@ configuration and coverage exclusions.
 |----------|--------------|
 | `.github/workflows/ktor-ci.yml` | Reusable CI (`workflow_call`): runs `./gradlew build koverXmlReport koverHtmlReport` plus a `koverVerify` coverage gate, posts a coverage summary and a PR comment, and uploads the Kover HTML report as an artifact. |
 
-Inputs: `java-version` (default `"21"`), `coverage-min` (default `90`),
-`working-directory` (default `"."`), `gradle-tasks-extra` (default `""`).
+Jobs: `secrets` (gitleaks, full history), `migrations` (squawk, only the changed
+`supabase/migrations/*.sql`, skipped when none changed) and `ktor-ci` (build and coverage).
+
+Inputs (all optional): `java-version` (default `"21"`), `coverage-min` (default `90`),
+`working-directory` (default `"."`), `gradle-tasks-extra` (default `""`),
+`mode` (`full` | `deploy`, default `full`), `migrations-path` (default
+`supabase/migrations`), `pg-version` (default `"17"`). Details, allowlists and
+exclusions in [`ktor-api/README.md`](ktor-api/README.md#jobs-de-segurança-e-migrations-v120).
 
 Also: `.github/workflows/ktor-cd.yml` — reusable CD (`workflow_call`): builds the image, pushes it to Artifact Registry and deploys to Cloud Run through Workload Identity Federation, then smoke-tests `/v1/health`. Modes: `build-and-deploy` (DEV) and `promote` (PROD, deploys the image already built for the commit). Details in [`ktor-api/README.md`](ktor-api/README.md#ktor-api-cd--artifact-registry--cloud-run).
 
@@ -56,10 +62,11 @@ Folder: [`kmp/`](kmp/README.md) — see that README for the coverage exclusions
 | Workflow | What it does |
 |----------|--------------|
 | `.github/workflows/kmp-ci.yml` | Reusable CI (`workflow_call`, Linux): Android build/lint plus detekt and ktlint, `commonTest`/JVM/Android unit tests, Konsist checks, desktop build, and an aggregated Kover report with a coverage gate. |
-| `.github/workflows/kmp-ios.yml` | Separate **optional** iOS job on macOS, run on a schedule or manually — **not** on every PR, to save macOS minutes (see [cost note](#manual-github-actions)). |
+| `.github/workflows/kmp-ios.yml` | Separate **optional** iOS job on macOS, run **only by `workflow_dispatch`** (manually, before each release) — no schedule and not on PRs, to save macOS minutes (see [cost note](#manual-github-actions)). |
 
-`kmp-ci.yml` inputs: `java-version` (default `"21"`), `coverage-min`
-(default `90`), `working-directory` (default `"."`).
+`kmp-ci.yml` jobs: `secrets` (gitleaks) and `kmp-ci`. Inputs (all optional):
+`java-version` (default `"21"`), `coverage-min` (default `90`),
+`working-directory` (default `"."`), `mode` (`full` | `deploy`, default `full`).
 
 > **Docs-only PRs pass without Gradle.** All reusable CIs detect docs-only
 > changes (`*.md`, `docs/**`, `.claude/**`) inside the job and skip the Gradle
@@ -88,6 +95,11 @@ Two kinds of tags are published:
   automatically get those updates without editing their `ci.yml`, while a
   breaking change would be published as `v2` (and a new `v2` moving tag).
 
+The features documented here (`secrets`/`migrations` jobs, `mode`,
+`migrations-path`, `pg-version`, iOS dispatch-only guard, concurrency) ship in
+**`v1.2.0`**: consumers should pin `@v1.2.0` (or `@v1` once it is moved to it).
+Consumers still pinned to `v1.0.x`/`v1.1.0` are unaffected.
+
 Recommended default is `@v1`: bug fixes and compatible improvements arrive
 automatically, and breaking changes never land without an explicit bump to
 `@v2`.
@@ -96,10 +108,14 @@ automatically, and breaking changes never land without an explicit bump to
 
 ## Consumer `ci.yml` examples
 
-The triggers below run the gate **before** merge (on the pull request) and
-**again after** merge (on the push to `main` or a `release/**` branch). The
-pre-merge run is what blocks a bad PR; the post-merge run confirms the merged
-state of the protected branch is still green.
+The triggers below run the full gate **before** merge (on the pull request) and
+a **light run after** merge (push to `main` or a `release/**` branch). The
+pre-merge run is what blocks a bad PR; the post-merge run uses `mode: deploy`
+(secrets scan + assemble only), so tests and coverage are not repeated: they
+already passed on the PR. The expression
+`mode: ${{ github.event_name == 'pull_request' && 'full' || 'deploy' }}` picks
+the mode from the trigger. New pushes to the same PR cancel the previous run
+(`concurrency` with `cancel-in-progress`); CD workflows are never cancelled.
 
 ### Ktor consumer
 
@@ -117,11 +133,14 @@ permissions:
   pull-requests: write   # required for the coverage PR comment
 jobs:
   ci:
-    uses: matheusbrum11/actions-workflows/.github/workflows/ktor-ci.yml@v1
+    uses: matheusbrum11/actions-workflows/.github/workflows/ktor-ci.yml@v1.2.0
     with:
+      mode: ${{ github.event_name == 'pull_request' && 'full' || 'deploy' }}
       java-version: "21"
       coverage-min: 90
       working-directory: "."
+      pg-version: "17"                       # Postgres major of the Supabase project
+      # migrations-path: supabase/migrations
       # gradle-tasks-extra: ""   # extra Gradle tasks if needed
 ```
 
@@ -141,15 +160,30 @@ permissions:
   pull-requests: write   # required for the coverage PR comment
 jobs:
   ci:
-    uses: matheusbrum11/actions-workflows/.github/workflows/kmp-ci.yml@v1
+    uses: matheusbrum11/actions-workflows/.github/workflows/kmp-ci.yml@v1.2.0
     with:
+      mode: ${{ github.event_name == 'pull_request' && 'full' || 'deploy' }}
       java-version: "21"
       coverage-min: 90
       working-directory: "."
 ```
 
-The optional iOS workflow (`kmp-ios.yml`) is wired separately — on a schedule or
-`workflow_dispatch` — and is intentionally kept off the per-PR path.
+The optional iOS workflow (`kmp-ios.yml`) is wired separately and runs **only by
+`workflow_dispatch`**, with no `schedule`. Dispatch it manually before each
+release (**Actions → iOS → Run workflow**, or `gh workflow run ios.yml --ref
+release/x.y.z`):
+
+```yaml
+# .github/workflows/ios.yml
+name: iOS
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ios:
+    uses: matheusbrum11/actions-workflows/.github/workflows/kmp-ios.yml@v1.2.0
+```
 
 ---
 
@@ -195,8 +229,25 @@ GitHub bills Actions minutes per runner type, and they are **not** equal:
 - **macOS runners cost about 10x** a Linux minute.
 
 This is exactly why the iOS build lives in a **separate, optional** workflow
-(`kmp-ios.yml`) that runs on a schedule or on demand, instead of on every PR.
-Keeping macOS off the per-PR path keeps routine CI on cheap Linux minutes.
+(`kmp-ios.yml`) that runs only on manual dispatch (before each release), instead
+of on every PR or on a schedule. Keeping macOS off the per-PR path keeps routine
+CI on cheap Linux minutes.
+
+Other cost levers already in place: `concurrency` cancels superseded runs of the
+same PR, `mode: deploy` skips repeated tests/coverage on pushes, docs-only
+changes skip Gradle, and `setup-gradle` caches dependencies (written only on the
+default branch, read-only elsewhere).
+
+**Where to see consumption:** on the account/organization page open
+**Settings → Billing and licensing → Usage** (older UI: **Settings → Billing &
+plans**), filter by product *Actions* and by repository to see minutes per runner
+type. Each repo's **Actions** tab also lists the duration of every run.
+
+**Budget (if a card is registered):** in the same billing area open **Budgets
+and alerts → New budget**, choose product *Actions* (or the whole account), set
+a monthly amount (for example US$ 5) and enable **Stop usage when budget limit is
+reached** if you want a hard stop instead of only e-mail alerts. Without a
+payment method, usage is capped by the free quota and nothing is charged.
 
 ---
 
