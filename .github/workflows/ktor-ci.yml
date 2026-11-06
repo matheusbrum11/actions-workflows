@@ -121,7 +121,9 @@ jobs:
           set -euo pipefail
           dir="${MIGRATIONS_PATH%/}"
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+            git fetch --no-tags origin "$BASE_REF"
+            git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" >/dev/null \
+              || { echo "::error::Base ref origin/$BASE_REF not found; cannot lint migrations"; exit 1; }
             range="origin/$BASE_REF...HEAD"
           elif [ -n "${EVENT_BEFORE:-}" ] && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
             range="$EVENT_BEFORE..HEAD"
@@ -129,7 +131,9 @@ jobs:
             range="HEAD~1..HEAD"
           fi
           # Only added/modified files: a deleted migration has nothing to lint.
-          git diff --name-only --diff-filter=AM "$range" -- "$dir/*.sql" > "$RUNNER_TEMP/migrations.txt" || true
+          # No "|| true": a git error (bad range, missing ref) must fail the job, not look like "no changes".
+          git diff --name-only --diff-filter=AM "$range" -- "$dir/*.sql" > "$RUNNER_TEMP/migrations.txt"
+          # grep -c exits 1 when there are zero matches, which is the legitimate empty case.
           count=$(grep -c . "$RUNNER_TEMP/migrations.txt" || true)
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Changed migrations: $count"
@@ -150,7 +154,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/squawk-venv"
-          "$RUNNER_TEMP/squawk-venv/bin/pip" install --quiet "squawk-cli==${SQUAWK_VERSION}"
+          # Hashes of the squawk-cli 2.71.0 linux wheels, from the PyPI JSON metadata. Update together with SQUAWK_VERSION.
+          cat > "$RUNNER_TEMP/squawk-requirements.txt" <<EOF
+          squawk-cli==${SQUAWK_VERSION} \\
+            --hash=sha256:421aed4ea504ebfccff1c04872067adc36b0c4cd0962334f8aa08e842302d89b \\
+            --hash=sha256:157d2377a53e16f401b662b9b8bab6e46a326b2774516a4c6957cc5f8ab6de21
+          EOF
+          "$RUNNER_TEMP/squawk-venv/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r "$RUNNER_TEMP/squawk-requirements.txt"
 
       - name: Lint changed migrations with squawk
         if: ${{ steps.changed.outputs.count != '0' }}

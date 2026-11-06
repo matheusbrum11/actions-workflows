@@ -233,7 +233,11 @@ arquivo `.gitleaksignore` na raiz (uma por linha).
 - Só roda em `mode: full`. Analisa **apenas** os `*.sql` adicionados/modificados em
   `migrations-path` no PR (`git diff` contra a base). Se nenhum mudou, o job termina
   com sucesso e registra isso no summary, sem instalar nada.
-- Instala `squawk-cli==2.71.0` (`pip`, em venv) e executa
+- Se a base do PR não puder ser obtida ou o `git diff` falhar, o job **falha** (não passa em silêncio).
+- Em `push` o intervalo é `before..HEAD`; sem `before` válido, cai para o último commit
+  (`HEAD~1..HEAD`). O squawk é um gate de PR: em push é só best-effort.
+- Instala `squawk-cli==2.71.0` (`pip --require-hashes`, em venv, hashes SHA-256 das wheels
+  Linux x86_64/aarch64 vindos do PyPI) e executa
   `squawk --pg-version=<pg-version> <arquivos>`. Qualquer achado falha o job.
 - `pg-version` deve ser a versão major do projeto Supabase (o vanb-api usa `17`).
   O input vence o `pg_version` de um eventual `.squawk.toml`.
@@ -287,7 +291,10 @@ pushes para `main`.
 
 Cada job usa `concurrency` com `cancel-in-progress: true`, agrupado por workflow do
 consumidor + número do PR (ou ref, em pushes). Um novo push na mesma PR cancela a
-execução anterior. CD/deploy nunca é cancelado (ver `ktor-cd.yml`).
+execução anterior. Isso vale também para pushes em `main`/`release/**`: um push novo
+cancela o CI do anterior. CD/deploy nunca é cancelado (ver `ktor-cd.yml`), mas um CD do
+consumidor que espere o CI via `workflow_run` ou `needs` ficaria bloqueado por um CI
+cancelado; nesse caso o CD deve rodar a partir do push mais recente.
 
 ---
 
