@@ -82,8 +82,12 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             # --verbose is avoided on purpose: it prints Match/Secret. Only the fields
             # below are extracted from the JSON report, never Match, Secret or Description.
-            if [ "$rc" -eq 1 ] && [ -s "$report" ]; then
-              jq -r '.[] | "RuleID=\(.RuleID) File=\(.File) Line=\(.StartLine) Commit=\(.Commit) Fingerprint=\(.Fingerprint)"' "$report"
+            if [ -s "$report" ]; then
+              # tojson escapes control characters (a file name may contain a newline), so no
+              # printed line can start with "::" and be run as a workflow command.
+              jq -r '.[] | "RuleID=\(.RuleID|tojson) File=\(.File|tojson) Line=\(.StartLine|tonumber? // 0) Commit=\(.Commit|tojson) Fingerprint=\(.Fingerprint|tojson)"' "$report" || true
+            else
+              echo "no gitleaks report produced"
             fi
             echo "::error::gitleaks failed (exit $rc). To allowlist a false positive see https://github.com/matheusbrum11/actions-workflows/blob/main/ktor-api/README.md#secrets--gitleaks"
             exit "$rc"
