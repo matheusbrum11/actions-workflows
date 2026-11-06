@@ -207,8 +207,12 @@ aparecem como `<job do consumidor> / secrets`, `/ migrations` e `/ ktor-ci`.
 - Roda sempre (inclusive em `mode: deploy`), com `fetch-depth: 0`, e varre **todo o
   histórico git**. O binário do gitleaks `8.30.1` é baixado do release oficial e
   validado por SHA-256 fixo no workflow.
-- Falha o CI se houver achados. A saída usa `--redact`: mostra regra, arquivo e
-  linha, **nunca** o valor do segredo.
+- Falha o CI se houver achados. O gitleaks roda com `--redact` e grava um relatório
+  JSON; o log imprime uma linha por achado com apenas `RuleID`, `File`, `Line`,
+  `Commit` e `Fingerprint` (nunca `Match`, `Secret` ou `Description`), mais um aviso
+  apontando para esta seção. Exemplo:
+  `RuleID=generic-api-key File=app/Config.kt Line=12 Commit=abc1234 Fingerprint=abc1234:app/Config.kt:generic-api-key:12`.
+  A `Fingerprint` é o valor usado no `.gitleaksignore`.
 - Se existir `.gitleaks.toml` na raiz do consumidor, ele é usado (estende as regras
   padrão). Um achado que já vazou deve ser **rotacionado**; só depois liberado.
 

@@ -84,13 +84,27 @@ jobs:
       - name: Scan git history for secrets
         run: |
           set -euo pipefail
-          args=(git --redact --no-banner --exit-code 1)
+          report="$RUNNER_TEMP/gitleaks.json"
+          args=(git --redact --no-banner --exit-code 1 --report-format json --report-path "$report")
           # An optional consumer config extends the defaults (allowlists, custom rules).
           if [ -f .gitleaks.toml ]; then
             args+=(--config .gitleaks.toml)
           fi
-          # --redact masks every secret value in the output; findings show rule and location only.
-          "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" .
+          rc=0
+          "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" . || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            # --verbose is avoided on purpose: it prints Match/Secret. Only the fields
+            # below are extracted from the JSON report, never Match, Secret or Description.
+            if [ -s "$report" ]; then
+              # tojson escapes control characters (a file name may contain a newline), so no
+              # printed line can start with "::" and be run as a workflow command.
+              jq -r '.[] | "RuleID=\(.RuleID|tojson) File=\(.File|tojson) Line=\(.StartLine|tonumber? // 0) Commit=\(.Commit|tojson) Fingerprint=\(.Fingerprint|tojson)"' "$report" || true
+            else
+              echo "no gitleaks report produced"
+            fi
+            echo "::error::gitleaks failed (exit $rc). To allowlist a false positive see https://github.com/matheusbrum11/actions-workflows/blob/main/ktor-api/README.md#secrets--gitleaks"
+            exit "$rc"
+          fi
 
   migrations:
     name: migrations
