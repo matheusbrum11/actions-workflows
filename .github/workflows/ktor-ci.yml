@@ -121,7 +121,8 @@ jobs:
           set -euo pipefail
           dir="${MIGRATIONS_PATH%/}"
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            git fetch --no-tags origin "$BASE_REF"
+            # No fetch: credentials are not persisted, and fetch-depth 0 already
+            # brought every remote branch, including the base.
             git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" >/dev/null \
               || { echo "::error::Base ref origin/$BASE_REF not found; cannot lint migrations"; exit 1; }
             range="origin/$BASE_REF...HEAD"
