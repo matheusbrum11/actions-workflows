@@ -232,3 +232,15 @@ jobs:
           name: kover-html-report
           path: ${{ inputs.working-directory }}/build/reports/kover/html/
           if-no-files-found: ignore
+
+      - name: Upload Roborazzi diff report
+        # Roborazzi writes *_actual.png and *_compare.png here when a verify
+        # fails. Limited to that path so nothing else (e.g. secrets) is uploaded;
+        # consumers without Roborazzi simply match no files.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roborazzi-diff
+          path: "**/build/outputs/roborazzi/**"
+          if-no-files-found: ignore
+          retention-days: 7

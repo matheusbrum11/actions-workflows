@@ -63,8 +63,16 @@ honest about what it measures.
 | 10 | Coverage gate | `./gradlew koverVerify` | aggregated coverage < minimum |
 | 11 | Summary + PR comment | Step Summary + `gh pr comment` | — |
 | 12 | Kover HTML artifact | `actions/upload-artifact` | — |
+| 13 | Roborazzi diff artifact (only on failure) | `actions/upload-artifact` | — |
 
 `commonTest` runs as part of the JVM/desktop and Android unit test tasks.
+
+When the job fails, the `roborazzi-diff` artifact is uploaded with everything
+under `**/build/outputs/roborazzi/**` (the `*_actual.png` and `*_compare.png`
+images of a screenshot verify diff). To download it, open the failed run in the
+repository's **Actions** tab and use the **Artifacts** section at the bottom of
+the run summary. It is kept for 7 days; projects without Roborazzi produce no
+files and no artifact.
 
 ---
 
