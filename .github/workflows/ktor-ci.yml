@@ -4,6 +4,13 @@
 # coverage verification (>= coverage-min). It publishes a coverage summary to
 # the job summary, posts/updates a PR comment, and uploads the Kover HTML report
 # as an artifact. Docs-only PRs pass without running Gradle.
+#
+# Jobs:
+#   secrets     gitleaks scan of the full git history (always runs).
+#   migrations  squawk lint of the Supabase migrations changed in the PR
+#               (mode=full only; skipped when no migration changed).
+#   ktor-ci     build, tests and coverage gate (mode=full); in mode=deploy it
+#               only assembles, so push runs do not repeat tests/coverage.
 # Call it from a consumer repo with `uses:` (see ktor-api/README.md).
 name: Ktor CI
 
@@ -26,6 +33,18 @@ on:
         description: "Extra Gradle tasks/flags appended to the build invocation."
         type: string
         default: ""
+      mode:
+        description: "full (PR gate: tests, coverage, migrations lint) or deploy (push to main/release: assemble only)."
+        type: string
+        default: "full"
+      migrations-path:
+        description: "Directory (from the repo root) with the Supabase SQL migrations linted by squawk."
+        type: string
+        default: "supabase/migrations"
+      pg-version:
+        description: "Postgres major version of the Supabase project, used by squawk to pick valid rules."
+        type: string
+        default: "17"
 
 # GITHUB_TOKEN only: read the code, write PR comments.
 permissions:
@@ -33,9 +52,131 @@ permissions:
   pull-requests: write
 
 jobs:
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: ktor-ci-secrets-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release checksums file.
+      GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+
+      - name: Scan git history for secrets
+        run: |
+          set -euo pipefail
+          args=(git --redact --no-banner --exit-code 1)
+          # An optional consumer config extends the defaults (allowlists, custom rules).
+          if [ -f .gitleaks.toml ]; then
+            args+=(--config .gitleaks.toml)
+          fi
+          # --redact masks every secret value in the output; findings show rule and location only.
+          "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" .
+
+  migrations:
+    name: migrations
+    if: ${{ inputs.mode == 'full' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: ktor-ci-migrations-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      SQUAWK_VERSION: "2.71.0"
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find changed migrations
+        id: changed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          MIGRATIONS_PATH: ${{ inputs.migrations-path }}
+        run: |
+          set -euo pipefail
+          dir="${MIGRATIONS_PATH%/}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+            range="origin/$BASE_REF...HEAD"
+          elif [ -n "${EVENT_BEFORE:-}" ] && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            range="$EVENT_BEFORE..HEAD"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          # Only added/modified files: a deleted migration has nothing to lint.
+          git diff --name-only --diff-filter=AM "$range" -- "$dir/*.sql" > "$RUNNER_TEMP/migrations.txt" || true
+          count=$(grep -c . "$RUNNER_TEMP/migrations.txt" || true)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Changed migrations: $count"
+          cat "$RUNNER_TEMP/migrations.txt"
+
+      - name: Report no migration changes
+        if: ${{ steps.changed.outputs.count == '0' }}
+        run: echo "No migration changed in this run; squawk skipped." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Python
+        if: ${{ steps.changed.outputs.count != '0' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install squawk
+        if: ${{ steps.changed.outputs.count != '0' }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/squawk-venv"
+          "$RUNNER_TEMP/squawk-venv/bin/pip" install --quiet "squawk-cli==${SQUAWK_VERSION}"
+
+      - name: Lint changed migrations with squawk
+        if: ${{ steps.changed.outputs.count != '0' }}
+        env:
+          PG_VERSION: ${{ inputs.pg-version }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < "$RUNNER_TEMP/migrations.txt"
+          # A .squawk.toml at the repo root is picked up automatically.
+          "$RUNNER_TEMP/squawk-venv/bin/squawk" --pg-version="$PG_VERSION" "${files[@]}"
+
   ktor-ci:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ktor-ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
     steps:
+      - name: Validate mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "$MODE" in
+            full|deploy) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected full or deploy)"; exit 1 ;;
+          esac
+
       - name: Checkout project
         uses: actions/checkout@v4
         with:
@@ -94,15 +235,22 @@ jobs:
 
       - name: Set up Gradle
         if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        # Cache is read-only outside the default branch (action default), so PRs
+        # reuse the cache written by pushes to main without polluting it.
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Assemble (deploy mode)
+        if: ${{ steps.changes.outputs.docs_only != 'true' && inputs.mode == 'deploy' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: ./gradlew assemble
+
       - name: Build, test and generate coverage reports
-        if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        if: ${{ steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full' }}
         working-directory: ${{ inputs.working-directory }}
         run: ./gradlew build koverXmlReport koverHtmlReport ${{ inputs.gradle-tasks-extra }}
 
       - name: Coverage summary and PR comment
-        if: ${{ !cancelled() && steps.changes.outputs.docs_only != 'true' }}
+        if: ${{ !cancelled() && steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full' }}
         working-directory: ${{ inputs.working-directory }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -162,7 +310,7 @@ jobs:
           fi
 
       - name: Upload Kover HTML report
-        if: ${{ !cancelled() && steps.changes.outputs.docs_only != 'true' }}
+        if: ${{ !cancelled() && steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full' }}
         uses: actions/upload-artifact@v4
         with:
           name: kover-html-report
@@ -170,6 +318,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Verify coverage gate
-        if: ${{ steps.changes.outputs.docs_only != 'true' }}
+        if: ${{ steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full' }}
         working-directory: ${{ inputs.working-directory }}
         run: ./gradlew koverVerify -PkoverMinCoverage=${{ inputs.coverage-min }}

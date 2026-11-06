@@ -188,6 +188,106 @@ the diff is accurate.
 | `coverage-min` | number | `90` | Minimum coverage; passed to `koverVerify` as `-PkoverMinCoverage`. |
 | `working-directory` | string | `"."` | Directory the Gradle build runs from. |
 | `gradle-tasks-extra` | string | `""` | Extra Gradle tasks/flags appended to the build invocation. |
+| `mode` | string | `"full"` | `full` (PR gate) or `deploy` (push to `main`/`release/**`: only `./gradlew assemble`, no tests/coverage/migrations lint). |
+| `migrations-path` | string | `"supabase/migrations"` | Pasta (a partir da raiz do repo) com as migrations SQL que o squawk analisa. |
+| `pg-version` | string | `"17"` | Versão major do Postgres do Supabase, usada pelo squawk. |
+
+Todos os inputs são opcionais; consumidores antigos continuam funcionando sem mudança.
+
+---
+
+## Jobs de segurança e migrations (v1.2.0+)
+
+O `ktor-ci.yml` agora tem três jobs independentes: `secrets`, `migrations` e
+`ktor-ci` (build/cobertura, como antes). Para quem exige status checks, os nomes
+aparecem como `<job do consumidor> / secrets`, `/ migrations` e `/ ktor-ci`.
+
+### `secrets` — gitleaks
+
+- Roda sempre (inclusive em `mode: deploy`), com `fetch-depth: 0`, e varre **todo o
+  histórico git**. O binário do gitleaks `8.30.1` é baixado do release oficial e
+  validado por SHA-256 fixo no workflow.
+- Falha o CI se houver achados. A saída usa `--redact`: mostra regra, arquivo e
+  linha, **nunca** o valor do segredo.
+- Se existir `.gitleaks.toml` na raiz do consumidor, ele é usado (estende as regras
+  padrão). Um achado que já vazou deve ser **rotacionado**; só depois liberado.
+
+Como criar uma allowlist (falso positivo, ex.: chave de teste pública):
+
+```toml
+# .gitleaks.toml
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public test key used in fixtures"
+paths = ['''src/test/resources/fixtures/.*''']
+regexes = ['''pk_test_[A-Za-z0-9]+''']
+```
+
+Alternativa por achado: adicionar a *fingerprint* impressa pelo gitleaks em um
+arquivo `.gitleaksignore` na raiz (uma por linha).
+
+### `migrations` — squawk
+
+- Só roda em `mode: full`. Analisa **apenas** os `*.sql` adicionados/modificados em
+  `migrations-path` no PR (`git diff` contra a base). Se nenhum mudou, o job termina
+  com sucesso e registra isso no summary, sem instalar nada.
+- Instala `squawk-cli==2.71.0` (`pip`, em venv) e executa
+  `squawk --pg-version=<pg-version> <arquivos>`. Qualquer achado falha o job.
+- `pg-version` deve ser a versão major do projeto Supabase (o vanb-api usa `17`).
+  O input vence o `pg_version` de um eventual `.squawk.toml`.
+- Se existir `.squawk.toml` na raiz do consumidor, ele é respeitado.
+
+Como excluir uma regra do squawk:
+
+```toml
+# .squawk.toml (raiz do repositório)
+excluded_rules = ["prefer-robust-stmts", "require-lock-timeout"]
+```
+
+Ou pontualmente, no próprio arquivo SQL, acima do statement:
+
+```sql
+-- squawk-ignore prefer-robust-stmts
+create table public.example (id bigint primary key);
+```
+
+Atenção: consulte `squawk --help`/a [doc de regras](https://squawkhq.com/docs/rules)
+para os nomes exatos das regras na versão fixada.
+
+### `mode: full` x `mode: deploy`
+
+| Trigger do consumidor | `mode` | O que roda |
+|-----------------------|--------|-----------|
+| `pull_request` | `full` (padrão) | secrets + migrations + build, testes, detekt/ktlint e gate de cobertura. |
+| `push` em `main` / `release/**` | `deploy` | secrets + `./gradlew assemble`. Sem testes/cobertura repetidos (já passaram no PR). |
+
+Como o `mode` depende do evento, o consumidor define o valor na chamada:
+
+```yaml
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+jobs:
+  ci:
+    uses: matheusbrum11/actions-workflows/.github/workflows/ktor-ci.yml@v1.2.0
+    with:
+      mode: ${{ github.event_name == 'pull_request' && 'full' || 'deploy' }}
+      pg-version: "17"
+```
+
+Observação sobre cache: o `setup-gradle` grava o cache só na branch padrão. Em
+`deploy`, o `main` aquece apenas as dependências de `assemble`; dependências de
+teste são baixadas de novo nos PRs. Se isso incomodar, use `mode: full` apenas nos
+pushes para `main`.
+
+### Concorrência
+
+Cada job usa `concurrency` com `cancel-in-progress: true`, agrupado por workflow do
+consumidor + número do PR (ou ref, em pushes). Um novo push na mesma PR cancela a
+execução anterior. CD/deploy nunca é cancelado (ver `ktor-cd.yml`).
 
 ---
 
