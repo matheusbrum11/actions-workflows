@@ -1,0 +1,111 @@
+# Reusable workflow: web CI (Vite + React + TypeScript).
+#
+# lint -> typecheck -> tests with coverage gate (Vitest, >= coverage-min) ->
+# build. Scripts are resolved from the consumer's package.json (see web/README.md).
+# The coverage gate is enforced by Vitest thresholds passed on the command line,
+# so the repo config can never silently lower it below coverage-min.
+name: Web CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version."
+        type: string
+        default: "22"
+      coverage-min:
+        description: "Minimum coverage percentage (lines, statements, functions, branches)."
+        type: number
+        default: 90
+      working-directory:
+        description: "Directory containing package.json."
+        type: string
+        default: "."
+      lint-script:
+        description: "npm script that runs the linter."
+        type: string
+        default: "lint"
+      typecheck-script:
+        description: "npm script that runs the type checker."
+        type: string
+        default: "typecheck"
+      test-script:
+        description: "npm script that runs Vitest with coverage."
+        type: string
+        default: "test:coverage"
+      build-script:
+        description: "npm script that builds the site; empty skips the build."
+        type: string
+        default: "build"
+
+permissions:
+  contents: read
+
+jobs:
+  web-ci:
+    name: web-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: web-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      COVERAGE_MIN: ${{ inputs.coverage-min }}
+      LINT_SCRIPT: ${{ inputs.lint-script }}
+      TYPECHECK_SCRIPT: ${{ inputs.typecheck-script }}
+      TEST_SCRIPT: ${{ inputs.test-script }}
+      BUILD_SCRIPT: ${{ inputs.build-script }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Lint
+        run: npm run "$LINT_SCRIPT"
+
+      - name: Typecheck
+        run: npm run "$TYPECHECK_SCRIPT"
+
+      - name: Tests and coverage gate
+        run: |
+          npm run "$TEST_SCRIPT" -- \
+            --coverage.thresholds.lines="$COVERAGE_MIN" \
+            --coverage.thresholds.statements="$COVERAGE_MIN" \
+            --coverage.thresholds.functions="$COVERAGE_MIN" \
+            --coverage.thresholds.branches="$COVERAGE_MIN"
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/lcov.info ]; then
+            awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END{
+              if (lf>0) printf "### Coverage\n\nLines: %.1f%% (gate %s%%)\n", lh*100/lf, ENVIRON["COVERAGE_MIN"]
+            }' coverage/lcov.info >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build
+        if: env.BUILD_SCRIPT != ''
+        run: npm run "$BUILD_SCRIPT"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-coverage
+          path: ${{ inputs.working-directory }}/coverage
+          if-no-files-found: ignore
+          retention-days: 7

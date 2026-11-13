@@ -1,0 +1,141 @@
+# Reusable workflow: web CD -> Cloudflare Workers (static assets).
+#
+# Builds the site from the checked-out ref and runs `wrangler deploy`.
+#   environment=dev   called on push to release/**; deploys the wrangler `dev` env.
+#   environment=prod  called on a vX.Y.Z tag; deploys the default (production) env.
+#
+# Credentials come from the GitHub Environment named after `environment`
+# (secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID; optional variable
+# WEB_SMOKE_URL). Callers pass `secrets: inherit`. See web/README.md.
+name: Web CD
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment name (dev or prod); scopes secrets and approvals."
+        type: string
+        required: true
+      wrangler-env:
+        description: "Wrangler environment (--env). Default: dev for environment=dev, none for prod."
+        type: string
+        default: ""
+      node-version:
+        description: "Node.js version."
+        type: string
+        default: "22"
+      working-directory:
+        description: "Directory containing package.json and the wrangler config."
+        type: string
+        default: "."
+      build-script:
+        description: "npm script that builds the site into the assets directory."
+        type: string
+        default: "build"
+      smoke-url:
+        description: "URL requested after the deploy; must return HTTP 200. Default: vars.WEB_SMOKE_URL; skipped when empty."
+        type: string
+        default: ""
+      smoke-timeout-seconds:
+        description: "Total time the smoke test keeps retrying."
+        type: number
+        default: 60
+    outputs:
+      sha:
+        description: "Commit SHA that was deployed."
+        value: ${{ jobs.deploy.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    # Never cancel a running deploy: a half-applied rollout is worse than waiting.
+    concurrency:
+      group: web-cd-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    outputs:
+      sha: ${{ github.sha }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      WRANGLER_ENV: ${{ inputs.wrangler-env }}
+      BUILD_SCRIPT: ${{ inputs.build-script }}
+      SMOKE_URL: ${{ inputs.smoke-url || vars.WEB_SMOKE_URL }}
+      SMOKE_TIMEOUT: ${{ inputs.smoke-timeout-seconds }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - name: Validate inputs and configuration
+        working-directory: .
+        run: |
+          case "$ENVIRONMENT" in
+            dev | prod) ;;
+            *) echo "::error::environment must be 'dev' or 'prod', got '$ENVIRONMENT'"; exit 1 ;;
+          esac
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            if [ "$GITHUB_REF_TYPE" != "tag" ] || ! printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::prod deploys only from a vX.Y.Z tag, got $GITHUB_REF_TYPE '$GITHUB_REF_NAME'"
+              exit 1
+            fi
+          fi
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is empty. Set it on the '$ENVIRONMENT' GitHub Environment and call this workflow with 'secrets: inherit'."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run "$BUILD_SCRIPT"
+
+      - name: Deploy with wrangler
+        run: |
+          if [ -z "$WRANGLER_ENV" ] && [ "$ENVIRONMENT" = "dev" ]; then
+            WRANGLER_ENV=dev
+          fi
+          if [ -n "$WRANGLER_ENV" ]; then
+            npx wrangler deploy --env "$WRANGLER_ENV"
+          else
+            npx wrangler deploy
+          fi
+
+      - name: Smoke test
+        if: env.SMOKE_URL != ''
+        run: |
+          deadline=$(( $(date +%s) + SMOKE_TIMEOUT ))
+          while true; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$SMOKE_URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "Smoke test passed ($SMOKE_URL returned 200)."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Smoke test failed: $SMOKE_URL returned ${code:-none} within ${SMOKE_TIMEOUT}s."
+              exit 1
+            fi
+            sleep 5
+          done
