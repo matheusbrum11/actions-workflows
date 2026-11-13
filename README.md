@@ -54,6 +54,8 @@ exclusions in [`ktor-api/README.md`](ktor-api/README.md#jobs-de-segurança-e-mig
 
 Also: `.github/workflows/ktor-cd.yml` — reusable CD (`workflow_call`): builds the image, pushes it to Artifact Registry and deploys to Cloud Run through Workload Identity Federation, then smoke-tests `/v1/health`. Modes: `build-and-deploy` (DEV) and `promote` (PROD, deploys the image already built for the commit). Details in [`ktor-api/README.md`](ktor-api/README.md#ktor-api-cd--artifact-registry--cloud-run).
 
+Web (Vite/React): `.github/workflows/web-ci.yml` (lint, typecheck, Vitest coverage gate >= 90%, build) and `.github/workflows/web-cd.yml` (`wrangler deploy` to Cloudflare Workers static assets, DEV on release, PROD on tag). Details in [`web/README.md`](web/README.md).
+
 ### KMP
 
 Folder: [`kmp/`](kmp/README.md) — see that README for the coverage exclusions
