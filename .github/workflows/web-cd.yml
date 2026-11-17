@@ -5,8 +5,9 @@
 #   environment=prod  called on a vX.Y.Z tag; deploys the default (production) env.
 #
 # Credentials come from the GitHub Environment named after `environment`
-# (secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID; optional variable
-# WEB_SMOKE_URL). Callers pass `secrets: inherit`. See web/README.md.
+# (secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID; optional variables
+# WEB_SMOKE_URL, VITE_TURNSTILE_SITE_KEY and VITE_API_BASE_URL, the last two passed
+# to the build as public Vite values). Callers pass `secrets: inherit`. See web/README.md.
 name: Web CD
 
 on:
@@ -110,6 +111,10 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Build
+        # Public build-time values (never secrets) come from the GitHub Environment variables.
+        env:
+          VITE_TURNSTILE_SITE_KEY: ${{ vars.VITE_TURNSTILE_SITE_KEY }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
         run: npm run "$BUILD_SCRIPT"
 
       - name: Deploy with wrangler
