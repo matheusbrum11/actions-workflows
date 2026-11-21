@@ -43,8 +43,9 @@ configuration and coverage exclusions.
 |----------|--------------|
 | `.github/workflows/ktor-ci.yml` | Reusable CI (`workflow_call`): runs `./gradlew build koverXmlReport koverHtmlReport` plus a `koverVerify` coverage gate, posts a coverage summary and a PR comment, and uploads the Kover HTML report as an artifact. |
 
-Jobs: `secrets` (gitleaks, full history), `migrations` (squawk, only the changed
-`supabase/migrations/*.sql`, skipped when none changed) and `ktor-ci` (build and coverage).
+One job, `ktor-ci`, runs as a pipeline from the cheapest step to the most expensive,
+stopping at the first failure: gitleaks (only the PR commits) → squawk (only the changed
+`supabase/migrations/*.sql`, skipped when none changed) → build, tests and coverage.
 
 Inputs (all optional): `java-version` (default `"21"`), `coverage-min` (default `90`),
 `working-directory` (default `"."`), `gradle-tasks-extra` (default `""`),
@@ -66,9 +67,11 @@ Folder: [`kmp/`](kmp/README.md) — see that README for the coverage exclusions
 | `.github/workflows/kmp-ci.yml` | Reusable CI (`workflow_call`, Linux): Android build/lint plus detekt and ktlint, `commonTest`/JVM/Android unit tests, Konsist checks, desktop build, and an aggregated Kover report with a coverage gate. |
 | `.github/workflows/kmp-ios.yml` | Separate **optional** iOS job on macOS, run **only by `workflow_dispatch`** (manually, before each release) — no schedule and not on PRs, to save macOS minutes (see [cost note](#manual-github-actions)). |
 
-`kmp-ci.yml` jobs: `secrets` (gitleaks) and `kmp-ci`. Inputs (all optional):
+`kmp-ci.yml` has one job, `kmp-ci`: gitleaks first, then a single Gradle invocation
+for lint, tests, Konsist, builds and the coverage gate. Inputs (all optional):
 `java-version` (default `"21"`), `coverage-min` (default `90`),
-`working-directory` (default `"."`), `mode` (`full` | `deploy`, default `full`).
+`working-directory` (default `"."`), `mode` (`full` | `deploy`, default `full`),
+`configuration-cache` (default `false`).
 
 > **Docs-only PRs pass without Gradle.** All reusable CIs detect docs-only
 > changes (`*.md`, `docs/**`, `.claude/**`) inside the job and skip the Gradle
@@ -97,10 +100,32 @@ Two kinds of tags are published:
   automatically get those updates without editing their `ci.yml`, while a
   breaking change would be published as `v2` (and a new `v2` moving tag).
 
-The features documented here (`secrets`/`migrations` jobs, `mode`,
+The features documented here (gitleaks/squawk steps, `mode`,
 `migrations-path`, `pg-version`, iOS dispatch-only guard, concurrency) ship in
 **`v1.2.0`**: consumers should pin `@v1.2.0` (or `@v1` once it is moved to it).
 Consumers still pinned to `v1.0.x`/`v1.1.0` are unaffected.
+
+### v1.3.0 (fewer Actions minutes)
+
+Same quality gate, fewer billed minutes. The owner creates the `v1.3.0` tag after
+merge; the examples below keep `@v1.2.0` until then.
+
+- **One job per run.** `kmp-ci` and `ktor-ci` no longer have separate `secrets` and
+  `migrations` jobs: gitleaks and squawk are steps of the main job, ordered from
+  cheapest to most expensive (gitleaks → squawk → lint → tests → build/coverage).
+  **Required status checks change:** `<caller> / secrets` and `<caller> / migrations`
+  no longer exist; only `<caller> / kmp-ci` and `<caller> / ktor-ci` remain. Update the
+  required checks when adopting `v1.3.0` (no branch protection exists today).
+- **gitleaks scans only what is new:** PR commits (`origin/<base>...HEAD`) or, on push,
+  `before..HEAD`. A new branch still scans the full history.
+- **Gradle cache** is written by pushes to `main` and `release/**`; PRs only read it.
+- **`kmp-ci` `mode: full`** runs one Gradle invocation (`--continue`) with every check.
+  New optional input `configuration-cache` (default `false`) adds `--configuration-cache`.
+- **`timeout-minutes`** on every job: 20 for CI, 25 for CD (`ktor-cd` was 30). `web-ci`
+  (20) and `web-cd` (15) already fit.
+- **`ktor-cd`:** the DEV deploy (`environment: dev`) cancels the run in progress, so the
+  last merge wins. Other environments, PROD included, never cancel. The database
+  migration is a separate job in the caller, with its own concurrency group.
 
 Recommended default is `@v1`: bug fixes and compatible improvements arrive
 automatically, and breaking changes never land without an explicit bump to
@@ -237,8 +262,10 @@ CI on cheap Linux minutes.
 
 Other cost levers already in place: `concurrency` cancels superseded runs of the
 same PR, `mode: deploy` skips repeated tests/coverage on pushes, docs-only
-changes skip Gradle, and `setup-gradle` caches dependencies (written only on the
-default branch, read-only elsewhere).
+changes skip Gradle, and `setup-gradle` caches dependencies (written by pushes to
+`main` and `release/**`, read-only in PRs). Since `v1.3.0` each CI run is a single job
+(each job is billed in whole minutes), gitleaks scans only new commits and every job
+has a `timeout-minutes`.
 
 **Where to see consumption:** on the account/organization page open
 **Settings → Billing and licensing → Usage** (older UI: **Settings → Billing &

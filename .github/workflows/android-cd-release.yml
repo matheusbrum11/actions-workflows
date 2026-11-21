@@ -78,6 +78,7 @@ permissions:
 jobs:
   release:
     runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 25
     steps:
       - name: Checkout (full history + tags)
         uses: actions/checkout@v4

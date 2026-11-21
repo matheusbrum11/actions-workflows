@@ -198,14 +198,22 @@ Todos os inputs são opcionais; consumidores antigos continuam funcionando sem m
 
 ## Jobs de segurança e migrations (v1.2.0+)
 
-O `ktor-ci.yml` agora tem três jobs independentes: `secrets`, `migrations` e
-`ktor-ci` (build/cobertura, como antes). Para quem exige status checks, os nomes
-aparecem como `<job do consumidor> / secrets`, `/ migrations` e `/ ktor-ci`.
+Desde a v1.3.0 o `ktor-ci.yml` tem **um único job**, `ktor-ci`, com os passos em
+esteira do mais barato para o mais caro, parando na primeira falha: gitleaks → squawk
+→ build, testes e cobertura. Cada job é cobrado em minutos inteiros, então juntar tudo
+evita pagar checkout e setup repetidos. O job tem `timeout-minutes: 20`.
 
-### `secrets` — gitleaks
+**Atenção aos checks obrigatórios:** na v1.2.0 existiam `<job do consumidor> / secrets`,
+`/ migrations` e `/ ktor-ci`. Na v1.3.0 só resta `<job do consumidor> / ktor-ci`. Quem
+exigir os outros dois nomes deve trocá-los ao adotar a v1.3.0, senão o PR fica
+esperando um check que nunca roda (hoje não há proteção de branch configurada).
 
-- Roda sempre (inclusive em `mode: deploy`), com `fetch-depth: 0`, e varre **todo o
-  histórico git**. O binário do gitleaks `8.30.1` é baixado do release oficial e
+### gitleaks (passo de segurança)
+
+- Roda sempre (inclusive em `mode: deploy` e em PR só de documentação), com
+  `fetch-depth: 0`. Em PR varre só os commits do PR (`--log-opts=origin/<base>...HEAD`);
+  em push varre `before..HEAD`; em branch nova (`before` zerado ou inexistente) varre
+  **todo o histórico**. O binário do gitleaks `8.30.1` é baixado do release oficial e
   validado por SHA-256 fixo no workflow.
 - Falha o CI se houver achados. O gitleaks roda com `--redact` e grava um relatório
   JSON; o log imprime uma linha por achado com apenas `RuleID`, `File`, `Line`,
@@ -232,10 +240,10 @@ regexes = ['''pk_test_[A-Za-z0-9]+''']
 Alternativa por achado: adicionar a *fingerprint* impressa pelo gitleaks em um
 arquivo `.gitleaksignore` na raiz (uma por linha).
 
-### `migrations` — squawk
+### squawk (passo de migrations)
 
 - Só roda em `mode: full`. Analisa **apenas** os `*.sql` adicionados/modificados em
-  `migrations-path` no PR (`git diff` contra a base). Se nenhum mudou, o job termina
+  `migrations-path` no PR (`git diff` contra a base). Se nenhum mudou, o passo termina
   com sucesso e registra isso no summary, sem instalar nada.
 - Se a base do PR não puder ser obtida ou o `git diff` falhar, o job **falha** (não passa em silêncio).
 - Em `push` o intervalo é `before..HEAD`; sem `before` válido, cai para o último commit
@@ -286,17 +294,18 @@ jobs:
       pg-version: "17"
 ```
 
-Observação sobre cache: o `setup-gradle` grava o cache só na branch padrão. Em
-`deploy`, o `main` aquece apenas as dependências de `assemble`; dependências de
-teste são baixadas de novo nos PRs. Se isso incomodar, use `mode: full` apenas nos
-pushes para `main`.
+Observação sobre cache: desde a v1.3.0 o `setup-gradle` grava o cache em pushes para
+`main` **e** `release/**`; PRs só leem (a base dos PRs é `release/**`, então deixam de
+rodar com cache frio). Em `deploy`, o push aquece apenas as dependências de
+`assemble`; dependências de teste são baixadas de novo nos PRs. Se isso incomodar, use
+`mode: full` apenas nos pushes para `release/**` e `main`.
 
 ### Concorrência
 
 Cada job usa `concurrency` com `cancel-in-progress: true`, agrupado por workflow do
 consumidor + número do PR (ou ref, em pushes). Um novo push na mesma PR cancela a
 execução anterior. Isso vale também para pushes em `main`/`release/**`: um push novo
-cancela o CI do anterior. CD/deploy nunca é cancelado (ver `ktor-cd.yml`), mas um CD do
+cancela o CI do anterior. O CD só cancela o deploy de DEV em andamento (ver `ktor-cd.yml`), mas um CD do
 consumidor que espere o CI via `workflow_run` ou `needs` ficaria bloqueado por um CI
 cancelado; nesse caso o CD deve rodar a partir do push mais recente.
 
@@ -332,8 +341,12 @@ Assim, a **mesma imagem** testada no DEV é a que vai para o PROD. O deploy usa
 a imagem pelo **digest** (`repo@sha256:...`), não pela tag, então o que sobe é
 exatamente o que foi resolvido naquele momento.
 
-Em ambos os modos: um único job, `concurrency` por repositório + ambiente (dois
-deploys não se sobrepõem; o segundo espera, nunca cancela o primeiro), secrets
+Em ambos os modos: um único job (`timeout-minutes: 25`), `concurrency` por repositório
++ ambiente (dois deploys não se sobrepõem). Desde a v1.3.0, no ambiente `dev` (valor
+exato do input `environment`) um novo deploy **cancela** o que está em andamento, e o
+último merge vence; em qualquer outro ambiente, PROD incluso, o segundo espera e nunca
+cancela o primeiro. A migration do banco não roda neste job: no vanb-api é o job
+`migrate-dev`, com `concurrency` própria e `cancel-in-progress: false`. Secrets
 injetados do Secret Manager com `--set-secrets` (o workflow só conhece os
 **nomes**, nunca os valores), e execução do serviço com a service account de
 runtime.

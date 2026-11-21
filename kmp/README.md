@@ -47,25 +47,24 @@ honest about what it measures.
 
 ## What the pipeline does
 
-`kmp-ci.yml` runs on **ubuntu-latest**, in order:
+`kmp-ci.yml` runs one job on **ubuntu-latest** (`timeout-minutes: 20`), as a pipeline
+from the cheapest step to the most expensive:
 
 | # | Step | Command | Fails the PR when… |
 |---|------|---------|--------------------|
 | 1 | Checkout (full history) | `actions/checkout` | — |
-| 2 | Detect code changes | in-job git diff | — (decides docs-only skip) |
-| 3 | Android build | `./gradlew assembleDebug` | compilation fails |
-| 4 | Android lint | `./gradlew lintDebug` | lint errors |
-| 5 | Static analysis | `./gradlew detekt ktlintCheck` | detekt/ktlint findings |
-| 6 | Unit tests | `./gradlew desktopTest testDebugUnitTest` | any test fails |
-| 7 | Konsist tests | `./gradlew konsistTest` | architecture rule broken |
-| 8 | Desktop build | `./gradlew desktopJar` | compilation fails |
-| 9 | Coverage report | `./gradlew koverXmlReport koverHtmlReport` | — (produces the report) |
-| 10 | Coverage gate | `./gradlew koverVerify` | aggregated coverage < minimum |
-| 11 | Summary + PR comment | Step Summary + `gh pr comment` | — |
-| 12 | Kover HTML artifact | `actions/upload-artifact` | — |
-| 13 | Roborazzi diff artifact (only on failure) | `actions/upload-artifact` | — |
+| 2 | Secrets scan | gitleaks on the PR commits (push: `before..HEAD`; new branch: full history) | a secret is found |
+| 3 | Detect code changes | in-job git diff | — (decides docs-only skip) |
+| 4 | Gradle gate (`mode: full`) | one `./gradlew --continue` call: `detekt ktlintCheck lintDebug`, `jvmTest testDebugUnitTest konsistTest`, `assembleDebug :desktopApp:assemble`, `koverXmlReport koverHtmlReport koverVerify` | lint, tests, architecture rule, build or coverage < minimum fails |
+| 4 | Android build (`mode: deploy`) | `./gradlew assembleDebug` | compilation fails |
+| 5 | Summary + PR comment | Step Summary + `gh pr comment` | — |
+| 6 | Kover HTML artifact | `actions/upload-artifact` | — |
+| 7 | Roborazzi diff artifact (only on failure) | `actions/upload-artifact` | — |
 
-`commonTest` runs as part of the JVM/desktop and Android unit test tasks.
+The single Gradle call pays the project configuration once; `--continue` reports every
+failure instead of stopping at the first one. `commonTest` runs as part of the
+JVM/desktop and Android unit test tasks. The Gradle cache is written by pushes to
+`main` and `release/**`; PRs only read it.
 
 When the job fails, the `roborazzi-diff` artifact is uploaded with everything
 under `**/build/outputs/roborazzi/**` (the `*_actual.png` and `*_compare.png`
@@ -104,10 +103,13 @@ jobs:
 | `coverage-min` | Minimum aggregated coverage percentage | `90` |
 | `working-directory` | Directory that holds the Gradle build | `"."` |
 | `mode` | `full` (PR gate) or `deploy` (push to `main`/`release/**`: only `assembleDebug`, no lint/tests/coverage) | `"full"` |
+| `configuration-cache` | Adds `--configuration-cache` to the `full` Gradle call. Enable only after testing that the project supports it | `false` |
 
-Ao contrário do Ktor, o KMP não tem job de migrations. O job `secrets` (gitleaks
-`8.30.1`, histórico completo, saída `--redact`, `.gitleaks.toml` opcional na raiz)
-roda sempre; veja a seção "Jobs de segurança" em [`../ktor-api/README.md`](../ktor-api/README.md#jobs-de-segurança-e-migrations-v120)
+Ao contrário do Ktor, o KMP não tem passo de migrations. O gitleaks (`8.30.1`, só os
+commits do PR, saída `--redact`, `.gitleaks.toml` opcional na raiz) é um passo do job
+`kmp-ci` e roda sempre. Desde a v1.3.0 o job `secrets` não existe mais: o check
+obrigatório `<job do consumidor> / secrets` deve ser trocado por
+`<job do consumidor> / kmp-ci`. Veja a seção "Jobs de segurança" em [`../ktor-api/README.md`](../ktor-api/README.md#jobs-de-segurança-e-migrations-v120)
 para allowlist. Triggers recomendados:
 
 ```yaml

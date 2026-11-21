@@ -6,10 +6,10 @@
 # koverVerify at the configured minimum. The iOS targets need macOS and live in
 # the separate, optional kmp-ios.yml.
 #
-# Jobs:
-#   secrets  gitleaks scan of the full git history (always runs).
-#   kmp-ci   full gate (mode=full) or only the Android assemble (mode=deploy),
-#            so push runs to main/release do not repeat tests/coverage.
+# A single job (kmp-ci) runs as a pipeline, cheapest step first, stopping at the
+# first failure: gitleaks (always runs) -> Gradle in one invocation (mode=full:
+# lint, tests, konsist, builds, coverage gate) or only the Android assemble
+# (mode=deploy), so push runs to main/release do not repeat tests/coverage.
 #
 # Call it from a consumer repo with `uses:` (see kmp/README.md).
 name: KMP CI
@@ -33,71 +33,26 @@ on:
         description: "full (PR gate: lint, tests, coverage) or deploy (push to main/release: assemble only)."
         type: string
         default: "full"
+      configuration-cache:
+        description: "Pass --configuration-cache to the full-mode Gradle invocation. Enable only if the project supports it."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  secrets:
-    name: secrets
+  kmp-ci:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 20
     concurrency:
-      group: kmp-ci-secrets-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      group: kmp-ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     env:
       GITLEAKS_VERSION: "8.30.1"
       # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release checksums file.
       GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-    steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install gitleaks
-        run: |
-          set -euo pipefail
-          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
-          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict -
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-
-      - name: Scan git history for secrets
-        run: |
-          set -euo pipefail
-          report="$RUNNER_TEMP/gitleaks.json"
-          args=(git --redact --no-banner --exit-code 1 --report-format json --report-path "$report")
-          # An optional consumer config extends the defaults (allowlists, custom rules).
-          if [ -f .gitleaks.toml ]; then
-            args+=(--config .gitleaks.toml)
-          fi
-          rc=0
-          "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" . || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            # --verbose is avoided on purpose: it prints Match/Secret. Only the fields
-            # below are extracted from the JSON report, never Match, Secret or Description.
-            if [ -s "$report" ]; then
-              # tojson escapes control characters (a file name may contain a newline), so no
-              # printed line can start with "::" and be run as a workflow command.
-              jq -r '.[] | "RuleID=\(.RuleID|tojson) File=\(.File|tojson) Line=\(.StartLine|tonumber? // 0) Commit=\(.Commit|tojson) Fingerprint=\(.Fingerprint|tojson)"' "$report" || true
-            else
-              echo "no gitleaks report produced"
-            fi
-            echo "::error::gitleaks failed (exit $rc). To allowlist a false positive see https://github.com/matheusbrum11/actions-workflows/blob/main/ktor-api/README.md#secrets--gitleaks"
-            exit "$rc"
-          fi
-
-  kmp-ci:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: kmp-ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -115,8 +70,58 @@ jobs:
       - name: Checkout project
         uses: actions/checkout@v4
         with:
-          # Full history so the docs-only diff can reach the PR base ref.
+          # Full history so gitleaks and the docs-only diff can reach the base ref.
           fetch-depth: 0
+
+      - name: Install gitleaks
+        working-directory: .
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+
+      - name: Scan commits for secrets
+        working-directory: .
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/gitleaks.json"
+          args=(git --redact --no-banner --exit-code 1 --report-format json --report-path "$report")
+          # An optional consumer config extends the defaults (allowlists, custom rules).
+          if [ -f .gitleaks.toml ]; then
+            args+=(--config .gitleaks.toml)
+          fi
+          # PR: only the commits of the PR. Push: only the new commits. A new branch
+          # (zeroed or unknown "before") scans the full history.
+          if [ "$EVENT_NAME" = "pull_request" ] && git rev-parse --verify --quiet "origin/${BASE_REF}^{commit}" >/dev/null; then
+            args+=("--log-opts=origin/${BASE_REF}...HEAD")
+          elif [ "$EVENT_NAME" != "pull_request" ] && [ -n "${EVENT_BEFORE:-}" ] \
+            && ! printf '%s' "$EVENT_BEFORE" | grep -Eq '^0+$' \
+            && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            args+=("--log-opts=${EVENT_BEFORE}..HEAD")
+          fi
+          rc=0
+          "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" . || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            # --verbose is avoided on purpose: it prints Match/Secret. Only the fields
+            # below are extracted from the JSON report, never Match, Secret or Description.
+            if [ -s "$report" ]; then
+              # tojson escapes control characters (a file name may contain a newline), so no
+              # printed line can start with "::" and be run as a workflow command.
+              jq -r '.[] | "RuleID=\(.RuleID|tojson) File=\(.File|tojson) Line=\(.StartLine|tonumber? // 0) Commit=\(.Commit|tojson) Fingerprint=\(.Fingerprint|tojson)"' "$report" || true
+            else
+              echo "no gitleaks report produced"
+            fi
+            echo "::error::gitleaks failed (exit $rc). To allowlist a false positive see https://github.com/matheusbrum11/actions-workflows/blob/main/ktor-api/README.md#secrets--gitleaks"
+            exit "$rc"
+          fi
 
       - name: Detect code changes
         id: changes
@@ -151,42 +156,30 @@ jobs:
 
       - name: Set up Gradle
         if: steps.changes.outputs.docs_only != 'true'
-        # Cache is read-only outside the default branch (action default), so PRs
-        # reuse the cache written by pushes to main without polluting it.
+        # Written by pushes to main and release/**; PRs (whose base is release/**) only read it.
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
-      - name: Android build
-        if: steps.changes.outputs.docs_only != 'true'
+      - name: Android build (deploy mode)
+        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'deploy'
         run: ./gradlew assembleDebug
 
-      - name: Android lint
+      - name: Gradle gate (lint, tests, build, coverage)
         if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        run: ./gradlew lintDebug
-
-      - name: Static analysis (detekt + ktlint)
-        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        run: ./gradlew detekt ktlintCheck
-
-      - name: Unit tests (commonTest / JVM / Android)
-        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        run: ./gradlew jvmTest testDebugUnitTest
-
-      - name: Konsist tests
-        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        run: ./gradlew konsistTest
-
-      - name: Desktop build
-        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        run: ./gradlew :desktopApp:assemble
-
-      - name: Coverage report (Kover)
-        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        run: ./gradlew koverXmlReport koverHtmlReport
-
-      - name: Coverage gate (koverVerify)
-        if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
-        # The consumer's koverVerify rule reads this property for its minimum.
-        run: ./gradlew koverVerify -Pkover.coverageThreshold=${{ inputs.coverage-min }}
+        env:
+          GRADLE_FLAGS: ${{ inputs.configuration-cache && '--configuration-cache' || '' }}
+        # One invocation pays the project configuration once. Tasks are listed cheapest
+        # first: lint, tests, konsist, builds, then coverage. --continue reports every
+        # failure instead of hiding later ones. The consumer's koverVerify rule reads
+        # kover.coverageThreshold for its minimum.
+        run: |
+          ./gradlew --continue $GRADLE_FLAGS \
+            detekt ktlintCheck lintDebug \
+            jvmTest testDebugUnitTest konsistTest \
+            assembleDebug :desktopApp:assemble \
+            koverXmlReport koverHtmlReport koverVerify \
+            -Pkover.coverageThreshold=${{ inputs.coverage-min }}
 
       - name: Coverage summary
         if: steps.changes.outputs.docs_only != 'true' && inputs.mode == 'full'
