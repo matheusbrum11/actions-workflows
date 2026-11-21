@@ -132,12 +132,15 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     environment: ${{ inputs.environment }}
-    # Never cancel a running deploy: a half-applied rollout is worse than waiting.
+    # Only the dev environment cancels a running deploy (the last merge wins and a new
+    # deploy follows right away). Any other environment, prod included, never cancels:
+    # a half-applied rollout is worse than waiting. The database migration is not part
+    # of this job, so it keeps its own concurrency group in the caller.
     concurrency:
       group: ktor-cd-${{ github.repository }}-${{ inputs.environment }}
-      cancel-in-progress: false
+      cancel-in-progress: ${{ inputs.environment == 'dev' }}
     outputs:
       service-url: ${{ steps.deploy.outputs.service-url }}
       revision: ${{ steps.deploy.outputs.revision }}

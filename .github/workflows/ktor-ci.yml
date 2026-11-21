@@ -1,16 +1,14 @@
 # Reusable workflow: Ktor API CI + coverage gate.
 #
-# Build (tests + detekt/ktlint via `build`) -> Kover XML/HTML reports ->
+# A single job (ktor-ci) runs as a pipeline, cheapest step first, stopping at the
+# first failure: gitleaks (always runs) -> squawk lint of the Supabase migrations
+# changed in the run (mode=full only; skipped when no migration changed) ->
+# Gradle build (tests + detekt/ktlint via `build`) -> Kover XML/HTML reports ->
 # coverage verification (>= coverage-min). It publishes a coverage summary to
 # the job summary, posts/updates a PR comment, and uploads the Kover HTML report
-# as an artifact. Docs-only PRs pass without running Gradle.
+# as an artifact. Docs-only PRs skip Gradle. In mode=deploy it only assembles,
+# so push runs do not repeat tests/coverage.
 #
-# Jobs:
-#   secrets     gitleaks scan of the full git history (always runs).
-#   migrations  squawk lint of the Supabase migrations changed in the PR
-#               (mode=full only; skipped when no migration changed).
-#   ktor-ci     build, tests and coverage gate (mode=full); in mode=deploy it
-#               only assembles, so push runs do not repeat tests/coverage.
 # Call it from a consumer repo with `uses:` (see ktor-api/README.md).
 name: Ktor CI
 
@@ -52,24 +50,32 @@ permissions:
   pull-requests: write
 
 jobs:
-  secrets:
-    name: secrets
+  ktor-ci:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 20
     concurrency:
-      group: ktor-ci-secrets-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      group: ktor-ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     env:
       GITLEAKS_VERSION: "8.30.1"
       # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release checksums file.
       GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+      SQUAWK_VERSION: "2.71.0"
     steps:
+      - name: Validate mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "$MODE" in
+            full|deploy) ;;
+            *) echo "::error::Invalid mode '$MODE' (expected full or deploy)"; exit 1 ;;
+          esac
+
       - name: Checkout project
         uses: actions/checkout@v4
         with:
+          # Full history so gitleaks, squawk and docs-only detection can diff against the base ref.
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Install gitleaks
         run: |
@@ -81,7 +87,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gitleaks"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
 
-      - name: Scan git history for secrets
+      - name: Scan commits for secrets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/gitleaks.json"
@@ -89,6 +99,15 @@ jobs:
           # An optional consumer config extends the defaults (allowlists, custom rules).
           if [ -f .gitleaks.toml ]; then
             args+=(--config .gitleaks.toml)
+          fi
+          # PR: only the commits of the PR. Push: only the new commits. A new branch
+          # (zeroed or unknown "before") scans the full history.
+          if [ "$EVENT_NAME" = "pull_request" ] && git rev-parse --verify --quiet "origin/${BASE_REF}^{commit}" >/dev/null; then
+            args+=("--log-opts=origin/${BASE_REF}...HEAD")
+          elif [ "$EVENT_NAME" != "pull_request" ] && [ -n "${EVENT_BEFORE:-}" ] \
+            && ! printf '%s' "$EVENT_BEFORE" | grep -Eq '^0+$' \
+            && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            args+=("--log-opts=${EVENT_BEFORE}..HEAD")
           fi
           rc=0
           "$RUNNER_TEMP/gitleaks/gitleaks" "${args[@]}" . || rc=$?
@@ -106,26 +125,9 @@ jobs:
             exit "$rc"
           fi
 
-  migrations:
-    name: migrations
-    if: ${{ inputs.mode == 'full' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    concurrency:
-      group: ktor-ci-migrations-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
-    env:
-      SQUAWK_VERSION: "2.71.0"
-    steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Find changed migrations
-        id: changed
+        id: migrations
+        if: ${{ inputs.mode == 'full' }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -135,8 +137,7 @@ jobs:
           set -euo pipefail
           dir="${MIGRATIONS_PATH%/}"
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            # No fetch: credentials are not persisted, and fetch-depth 0 already
-            # brought every remote branch, including the base.
+            # No fetch: fetch-depth 0 already brought every remote branch, including the base.
             git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" >/dev/null \
               || { echo "::error::Base ref origin/$BASE_REF not found; cannot lint migrations"; exit 1; }
             range="origin/$BASE_REF...HEAD"
@@ -155,17 +156,17 @@ jobs:
           cat "$RUNNER_TEMP/migrations.txt"
 
       - name: Report no migration changes
-        if: ${{ steps.changed.outputs.count == '0' }}
+        if: ${{ inputs.mode == 'full' && steps.migrations.outputs.count == '0' }}
         run: echo "No migration changed in this run; squawk skipped." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Python
-        if: ${{ steps.changed.outputs.count != '0' }}
+        if: ${{ inputs.mode == 'full' && steps.migrations.outputs.count != '0' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install squawk
-        if: ${{ steps.changed.outputs.count != '0' }}
+        if: ${{ inputs.mode == 'full' && steps.migrations.outputs.count != '0' }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/squawk-venv"
@@ -179,7 +180,7 @@ jobs:
             -r "$RUNNER_TEMP/squawk-requirements.txt"
 
       - name: Lint changed migrations with squawk
-        if: ${{ steps.changed.outputs.count != '0' }}
+        if: ${{ inputs.mode == 'full' && steps.migrations.outputs.count != '0' }}
         env:
           PG_VERSION: ${{ inputs.pg-version }}
         run: |
@@ -187,27 +188,6 @@ jobs:
           mapfile -t files < "$RUNNER_TEMP/migrations.txt"
           # A .squawk.toml at the repo root is picked up automatically.
           "$RUNNER_TEMP/squawk-venv/bin/squawk" --pg-version="$PG_VERSION" "${files[@]}"
-
-  ktor-ci:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: ktor-ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
-    steps:
-      - name: Validate mode
-        env:
-          MODE: ${{ inputs.mode }}
-        run: |
-          case "$MODE" in
-            full|deploy) ;;
-            *) echo "::error::Invalid mode '$MODE' (expected full or deploy)"; exit 1 ;;
-          esac
-
-      - name: Checkout project
-        uses: actions/checkout@v4
-        with:
-          # Full history so docs-only detection can diff against the PR base ref.
-          fetch-depth: 0
 
       - name: Detect docs-only changes
         id: changes
@@ -261,9 +241,10 @@ jobs:
 
       - name: Set up Gradle
         if: ${{ steps.changes.outputs.docs_only != 'true' }}
-        # Cache is read-only outside the default branch (action default), so PRs
-        # reuse the cache written by pushes to main without polluting it.
+        # Written by pushes to main and release/**; PRs (whose base is release/**) only read it.
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
       - name: Assemble (deploy mode)
         if: ${{ steps.changes.outputs.docs_only != 'true' && inputs.mode == 'deploy' }}
